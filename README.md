@@ -11,4 +11,4 @@
 
 1. `cd nvidia`
 2. `sh install.sh`
-3. `docker run --rm --gpus all gpu_burn`
+3. `docker run --rm --gpus all gpu_burn ./gpu_burn 10`
