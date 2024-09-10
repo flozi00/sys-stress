@@ -7,3 +7,9 @@ docker run --runtime nvidia --gpus all \
     vllm/vllm-openai:latest --model neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8 --max-model-len 8192 --cpu-offload-gb 0 --enable-prefix-caching --num-scheduler-steps 12 --tensor-parallel-size 4 --quantization compressed-tensors --port 8000 --enforce-eager --swap-space 4 --gpu-memory-utilization 0.95
 
 ```
+
+Alternative Driver+Cuda install
+```
+wget https://developer.download.nvidia.com/compute/cuda/12.6.1/local_installers/cuda_12.6.1_560.35.03_linux.run
+sudo sh cuda_12.6.1_560.35.03_linux.run
+```
