@@ -16,3 +16,16 @@ wget -nv https://vault.habana.ai/artifactory/gaudi-installer/1.18.0/habanalabs-i
 chmod +x habanalabs-installer.sh
 ./habanalabs-installer.sh install --type base
 sudo apt install -y habanalabs-container-runtime
+
+sudo tee /etc/docker/daemon.json <<EOF
+{
+    "runtimes": {
+        "habana": {
+            "path": "/usr/bin/habana-container-runtime",
+            "runtimeArgs": []
+        }
+    }
+}
+EOF
+
+sudo systemctl restart docker
