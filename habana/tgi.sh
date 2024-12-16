@@ -1,0 +1,26 @@
+model=unsloth/Llama-3.3-70B-Instruct
+volume=$PWD/data   # share a volume with the Docker container to avoid downloading weights every run
+
+docker run -p 8080:80 \
+   --runtime=habana \
+   -v $volume:/data \
+   -e HABANA_VISIBLE_DEVICES=all \
+   -e OMPI_MCA_btl_vader_single_copy_mechanism=none \
+   -e TEXT_GENERATION_SERVER_IGNORE_EOS_TOKEN=true \
+   -e PT_HPU_ENABLE_LAZY_COLLECTIVES=true \
+   -e MAX_TOTAL_TOKENS=2048 \
+   -e BATCH_BUCKET_SIZE=256 \
+   -e PREFILL_BATCH_BUCKET_SIZE=4 \
+   -e PAD_SEQUENCE_TO_MULTIPLE_OF=64 \
+   -e ENABLE_HPU_GRAPH=true \
+   -e LIMIT_HPU_GRAPH=true \
+   -e USE_FLASH_ATTENTION=true \
+   -e FLASH_ATTENTION_RECOMPUTE=true \
+   --cap-add=sys_nice \
+   --ipc=host \
+   ghcr.io/huggingface/tgi-gaudi:2.0.6 \
+   --model-id $model \
+   --sharded true --num-shard 8 \
+   --max-input-length 32000 --max-total-tokens 36000 \
+   --max-batch-prefill-tokens 34000 --max-batch-total-tokens 524288 \
+   --max-waiting-tokens 7 --waiting-served-ratio 1.2 --max-concurrent-requests 512
