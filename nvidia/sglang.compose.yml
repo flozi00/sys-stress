@@ -1,0 +1,45 @@
+services:
+  sglang:
+    image: lmsysorg/sglang:latest
+    container_name: sglang
+    volumes:
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      # If you use modelscope, you need mount this directory
+      # - ${HOME}/.cache/modelscope:/root/.cache/modelscope
+    restart: always
+    network_mode: host # required by RDMA
+    privileged: true # required by RDMA
+    # Or you can only publish port 30000
+    # ports:
+    #   - 30000:30000
+    environment:
+      HF_TOKEN: <secret>
+    entrypoint: python3 -m sglang.launch_server
+    # check args here https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py
+    command: --model-path nm-testing/Llama-3.3-70B-Instruct-FP8-dynamic
+      --host 0.0.0.0
+      --port 30000
+      --kv-cache-dtype fp8_e5m2
+      --quantization fp8
+      --mem-fraction-static 0.85
+      --tensor-parallel-size 2
+      --attention-backend flashinfer
+      --sampling-backend flashinfer
+      --grammar-backend xgrammar
+      --enable-double-sparsity
+      --enable-mixed-chunk
+      --tool-call-parser llama3
+      --enable-hierarchical-cache
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0","1"]
+              capabilities: [gpu]
