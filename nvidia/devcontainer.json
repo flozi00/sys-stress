@@ -1,0 +1,27 @@
+{
+  "name": "CUDA",
+  "image": "nvcr.io/nvidia/pytorch:25.01-py3",
+  "runArgs": [
+    "--gpus=all",
+    "--shm-size=128g"
+  ],
+  "postCreateCommand": [
+    "nvidia-smi"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "ms-toolsai.vscode-jupyter-cell-tags",
+        "ms-toolsai.jupyter-keymap",
+        "ms-toolsai.jupyter-renderers",
+        "ms-toolsai.vscode-jupyter-slideshow",
+        "ms-python.vscode-pylance"
+      ]
+    }
+  },
+  "mounts": [
+     "source=${localEnv:HOME}/.cache/huggingface,target=/root/.cache/huggingface,type=bind,consistency=cached"
+  ]
+}
