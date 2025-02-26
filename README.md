@@ -12,4 +12,4 @@
 1. `cd nvidia`
 2. `sh install.sh`
 3. `nvidia-smi`
-4. `docker run --rm --gpus all gpu_burn ./gpu_burn 120 -m 90%`
+4. `docker run --rm --gpus all gpu_burn ./gpu_burn 120 -m "90%"`
