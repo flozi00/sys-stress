@@ -36,6 +36,6 @@ sudo systemctl daemon-reload
 sudo systemctl restart docker
 
 
-git clone https://github.com/wilicc/gpu-burn
+git clone https://github.com/flozi00/gpu-burn
 cd gpu-burn
 docker build -t gpu_burn .
