@@ -1,5 +1,5 @@
 apt update
-apt install apt install cuda-drivers-fabricmanager-550 -y
+apt install cuda-drivers-fabricmanager-550 -y
 apt install nvidia-driver-550-server -y
 systemctl start nvidia-fabricmanager.service
 
