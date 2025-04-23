@@ -20,5 +20,4 @@ echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' \
 sudo apt update
 
 
-sudo apt install amdgpu-dkms
-sudo reboot
+sudo apt install amdgpu-dkms -y
