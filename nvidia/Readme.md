@@ -13,3 +13,11 @@ Alternative Driver+Cuda install
 wget https://developer.download.nvidia.com/compute/cuda/12.6.1/local_installers/cuda_12.6.1_560.35.03_linux.run
 sudo sh cuda_12.6.1_560.35.03_linux.run
 ```
+
+or
+
+```
+sudo add-apt-repository ppa:graphics-drivers/ppa
+sudo apt update
+sudo apt install nvidia-driver-570-open
+```
