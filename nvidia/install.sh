@@ -2,9 +2,7 @@ apt update
 
 add-apt-repository ppa:graphics-drivers/ppa
 apt update
-apt install nvidia-driver-570-open -y
-
-systemctl start nvidia-fabricmanager.service
+apt install nvidia-driver-575-open -y
 
 for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do sudo apt-get remove $pkg; done
 
