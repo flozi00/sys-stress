@@ -2,7 +2,7 @@ apt update
 
 add-apt-repository ppa:graphics-drivers/ppa
 apt update
-apt install nvidia-driver-575-open -y
+apt install nvidia-driver-580-open -y
 
 for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do sudo apt-get remove $pkg; done
 
