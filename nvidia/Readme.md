@@ -19,3 +19,9 @@ then put to the default linux params:
 ```bash
 quiet splash nokaslr
 ```
+
+followed by:
+```bash
+sudo update-grub
+sudo reboot now
+```
