@@ -17,7 +17,7 @@ sudo nano /etc/default/grub
 then put to the default linux params:
 
 ```bash
-quiet splash nokaslr
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash nokaslr"
 ```
 
 followed by:
