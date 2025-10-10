@@ -1,0 +1,42 @@
+version: '3'
+services:
+  trt-server:
+    image: rocm/vllm:latest
+    pull_policy: always
+    container_name: trt-server
+    volumes:
+      - ./volume_mounts/hf_cache:/root/.cache/huggingface
+      - ./volume_mounts/vllm_cache:/root/.cache/vllm
+    restart: always
+    ports:
+      - "9090:9090"
+    stdin_open: true
+    tty: true
+    ipc: host
+    network_mode: host
+    devices:
+        - /dev/kfd
+        - /dev/dri
+    security_opt:
+        - seccomp=unconfined
+    group_add:
+        - video
+    command: >
+      --model cpatonn/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit
+      --host 0.0.0.0
+      --port 9090
+      --max-model-len 64000
+      --gpu-memory-utilization 0.9
+      --served-model-name smolagent
+      --tensor-parallel-size 2
+      --pipeline-parallel-size 1
+      --compilation-config '{"cudagraph_mode": "FULL", "level":3,"backend":"","compile_sizes":[1,2],"cudagraph_num_of_warmups":4,"cudagraph_capture_sizes":[1,2],"max_capture_size":4}'
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    shm_size: "64gb"
+    environment:
+      - VLLM_ROCM_USE_AITER=1
+      - VLLM_USE_AITER_UNIFIED_ATTENTION=1
+      - VLLM_ROCM_USE_AITER_MHA=0
+
