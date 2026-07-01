@@ -10,7 +10,7 @@ docker run --runtime nvidia --gpus all \
 
 ## vLLM single-GPU benchmark
 
-Set `HF_TOKEN` to a Hugging Face token with Llama 3.3 access. The named Docker
+The named Docker
 volume keeps downloaded model weights across runs.
 This uses a pre-quantized 4-bit 70B checkpoint to stress one large data-center
 GPU. The default workload processes 10,000 requests with 512 generated tokens
@@ -28,7 +28,6 @@ mkdir -p vllm-results
 
 docker run --rm --runtime nvidia --gpus '"device=0"' \
     --ipc=host \
-    --env HF_TOKEN \
     -v vllm-hf-cache:/root/.cache/huggingface \
     -v "$PWD/vllm-results:/results" \
     --entrypoint bash \
