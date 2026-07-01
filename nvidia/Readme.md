@@ -8,6 +8,31 @@ docker run --runtime nvidia --gpus all \
 
 ```
 
+## vLLM single-GPU benchmark
+
+Set `HF_TOKEN` to a Hugging Face token with Llama 3.3 access. The named Docker
+volume keeps downloaded model weights across runs.
+This uses a pre-quantized 4-bit 70B checkpoint to stress one large data-center
+GPU. Lower the token lengths first if a smaller-memory card runs out of memory.
+
+```bash
+docker run --rm --runtime nvidia --gpus '"device=0"' \
+    --ipc=host \
+    --env "HF_TOKEN=$HF_TOKEN" \
+    -v vllm-hf-cache:/root/.cache/huggingface \
+    --entrypoint vllm \
+    vllm/vllm-openai:latest \
+    bench throughput \
+    --model unsloth/Llama-3.3-70B-Instruct-bnb-4bit \
+    --backend vllm \
+    --dataset-name random \
+    --random-input-len 1024 \
+    --random-output-len 256 \
+    --num-prompts 512 \
+    --max-model-len 4096 \
+    --dtype bfloat16
+```
+
 Due to inkompitability issues in some cases the grub params needs to be edited.
 
 ```bash
