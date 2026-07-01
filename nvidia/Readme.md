@@ -13,25 +13,66 @@ docker run --runtime nvidia --gpus all \
 Set `HF_TOKEN` to a Hugging Face token with Llama 3.3 access. The named Docker
 volume keeps downloaded model weights across runs.
 This uses a pre-quantized 4-bit 70B checkpoint to stress one large data-center
-GPU. Lower the token lengths first if a smaller-memory card runs out of memory.
+GPU. The default workload processes 10,000 requests with 512 generated tokens
+each, which is intended to run for roughly one hour on one large data-center GPU.
+Exact duration depends on the GPU; adjust `--num-prompts` after the first run.
+
+The benchmark writes these files to `vllm-results`:
+
+- `vllm-throughput-<timestamp>.log`: full terminal output
+- `vllm-throughput-<timestamp>.json`: vLLM throughput statistics
+- `vllm-gpu-<timestamp>.csv`: sampled GPU utilization, memory, power, and temperature
 
 ```bash
+mkdir -p vllm-results
+
 docker run --rm --runtime nvidia --gpus '"device=0"' \
     --ipc=host \
-    --env "HF_TOKEN=$HF_TOKEN" \
+    --env HF_TOKEN \
     -v vllm-hf-cache:/root/.cache/huggingface \
-    --entrypoint vllm \
+    -v "$PWD/vllm-results:/results" \
+    --entrypoint bash \
     vllm/vllm-openai:latest \
-    bench throughput \
+    -lc '
+set -euo pipefail
+
+ts=$(date -u +%Y%m%dT%H%M%SZ)
+gpu_stats="/results/vllm-gpu-${ts}.csv"
+run_log="/results/vllm-throughput-${ts}.log"
+run_json="/results/vllm-throughput-${ts}.json"
+
+gpu_logger=
+if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi \
+        --query-gpu=timestamp,index,name,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,temperature.gpu \
+        --format=csv \
+        -l 5 > "${gpu_stats}" &
+    gpu_logger=$!
+fi
+
+cleanup() {
+    if [ -n "${gpu_logger}" ]; then
+        kill "${gpu_logger}" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+vllm bench throughput \
     --model unsloth/Llama-3.3-70B-Instruct-bnb-4bit \
     --backend vllm \
     --dataset-name random \
     --random-input-len 1024 \
-    --random-output-len 256 \
-    --num-prompts 512 \
-    --max-model-len 4096 \
-    --dtype bfloat16
+    --random-output-len 512 \
+    --num-prompts 10000 \
+    --num-warmups 32 \
+    --max-model-len 2048 \
+    --dtype bfloat16 \
+    --output-json "${run_json}" 2>&1 | tee "${run_log}"
+'
 ```
+
+For a closer one-hour target after a first run, set `--num-prompts` to about
+`3600 * requests_per_second` from the JSON result.
 
 Due to inkompitability issues in some cases the grub params needs to be edited.
 
