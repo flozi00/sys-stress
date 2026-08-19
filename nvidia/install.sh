@@ -42,6 +42,7 @@ sudo systemctl daemon-reload
 sudo systemctl restart docker
 
 
-git clone https://github.com/flozi00/gpu-burn
-cd gpu-burn
-docker build -t gpu_burn .
+# Build the vendor neutral, Triton based GPU stress test image.
+# The same test also runs on AMD GPUs (see ../gpu-stress/Dockerfile.rocm).
+cd "$(dirname "$0")/../gpu-stress"
+docker build -f Dockerfile.nvidia -t gpu-stress .

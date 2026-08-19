@@ -1,0 +1,9 @@
+# Triton GPU stress test - NVIDIA / CUDA image.
+# The NGC PyTorch image already ships a matching CUDA enabled PyTorch + Triton.
+FROM nvcr.io/nvidia/pytorch:25.01-py3
+
+WORKDIR /workspace/gpu-stress
+COPY gpu_stress.py .
+
+ENTRYPOINT ["python3", "gpu_stress.py"]
+CMD ["--duration", "120"]
