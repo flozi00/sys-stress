@@ -58,6 +58,22 @@ except Exception as exc:  # pragma: no cover - import guard
 LOGGER = logging.getLogger("gpu_stress")
 
 
+# Helion is optional. When available it is used to autotune a matrix-multiply
+# based compute phase, which drives the tensor/matrix cores much harder than a
+# plain FP32 ALU loop and therefore reaches maximum GPU power draw. If it cannot
+# be imported (not installed, or unsupported build) we transparently fall back
+# to the pure Triton kernels below.
+try:  # pragma: no cover - environment dependent
+    import helion
+    import helion.language as hl
+
+    _HELION_AVAILABLE = True
+except Exception:  # pragma: no cover - environment dependent
+    helion = None
+    hl = None
+    _HELION_AVAILABLE = False
+
+
 # --------------------------------------------------------------------------- #
 # Triton kernels
 # --------------------------------------------------------------------------- #
@@ -95,6 +111,30 @@ def _copy_kernel(src_ptr, dst_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
 # FLOPs performed per input element in a single `_compute_kernel` launch.
 # 2 FMA operations per inner iteration, each FMA counts as 2 FLOPs.
 _FLOPS_PER_ELEM_PER_ITER = 4
+
+
+# --------------------------------------------------------------------------- #
+# Helion kernel (optional, autotuned matmul)
+# --------------------------------------------------------------------------- #
+if _HELION_AVAILABLE:  # pragma: no cover - requires a GPU + helion
+
+    @helion.kernel()
+    def _helion_matmul(x: "torch.Tensor", y: "torch.Tensor") -> "torch.Tensor":
+        """Autotuned matmul used to drive the matrix cores at maximum power.
+
+        Helion searches hundreds of Triton implementations on the first call and
+        keeps the fastest one for the running hardware, so the same source
+        reaches peak throughput on both NVIDIA and AMD GPUs.
+        """
+        m, k = x.size()
+        k2, n = y.size()
+        out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+        for tile_m, tile_n in hl.tile([m, n]):
+            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(k):
+                acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+            out[tile_m, tile_n] = acc
+        return out
 
 
 # --------------------------------------------------------------------------- #
@@ -208,6 +248,7 @@ class GpuResult:
     last_tflops: float = 0.0
     best_bandwidth: float = 0.0
     last_bandwidth: float = 0.0
+    backend: str = "triton"
     failed: bool = False
     message: str = ""
 
@@ -220,7 +261,24 @@ class StressConfig:
     block_size: int
     error_check: bool
     log_interval: float
+    compute_backend: str = "auto"
     devices: list[int] = field(default_factory=list)
+
+
+def resolve_backend(requested: str) -> str:
+    """Resolve the effective compute backend from the requested value."""
+    requested = requested.strip().lower()
+    if requested == "helion":
+        if not _HELION_AVAILABLE:
+            LOGGER.warning(
+                "Helion backend requested but helion is not importable; "
+                "falling back to the Triton compute kernel."
+            )
+            return "triton"
+        return "helion"
+    if requested == "auto":
+        return "helion" if _HELION_AVAILABLE else "triton"
+    return "triton"
 
 
 def _run_on_device(
@@ -231,37 +289,54 @@ def _run_on_device(
     stop: threading.Event,
 ):
     """Continuously stress a single GPU until ``deadline`` or ``stop``."""
+    backend = resolve_backend(cfg.compute_backend)
+    result.backend = backend
     try:
         torch.cuda.set_device(device)
         dev = torch.device(f"cuda:{device}")
         dtype = torch.float32
 
         free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-        # Buffers for compute (x, out) and memory (src, dst).
         budget = int(free_bytes * cfg.mem_fraction)
-        # 4 buffers of equal size, 4 bytes per fp32 element.
-        n_elements = max(1, budget // (4 * 4))
-        # Round to a multiple of the block size.
-        n_elements = (n_elements // cfg.block_size) * cfg.block_size
-        n_elements = max(cfg.block_size, n_elements)
+        # Split the budget between the memory phase (src, dst) and the compute
+        # phase, so both can run without exhausting device memory.
+        mem_budget = budget // 2
+        compute_budget = budget - mem_budget
 
-        x = torch.randn(n_elements, device=dev, dtype=dtype)
-        out = torch.empty_like(x)
-        src = torch.randn(n_elements, device=dev, dtype=dtype)
+        # Memory phase buffers: 2 buffers, 4 bytes per fp32 element.
+        mem_n = max(1, mem_budget // (2 * 4))
+        mem_n = max(cfg.block_size, (mem_n // cfg.block_size) * cfg.block_size)
+        src = torch.randn(mem_n, device=dev, dtype=dtype)
         dst = torch.empty_like(src)
+        mem_grid = (triton.cdiv(mem_n, cfg.block_size),)
+        buffer_bytes = mem_n * 4
 
-        grid = (triton.cdiv(n_elements, cfg.block_size),)
-        buffer_bytes = n_elements * 4
+        # Compute phase buffers depend on the backend.
+        if backend == "helion":
+            # matmul buffers a (n,n), b (n,n), c (n,n): 3 buffers.
+            n = int((compute_budget / (3 * 4)) ** 0.5)
+            n = max(256, (n // 256) * 256)
+            mat_a = torch.randn(n, n, device=dev, dtype=dtype)
+            mat_b = torch.randn(n, n, device=dev, dtype=dtype)
+            matmul_flops = 2.0 * n * n * n
+            compute_desc = f"matmul {n}x{n}"
+        else:
+            # FMA-loop buffers x, out: 2 buffers.
+            comp_n = max(1, compute_budget // (2 * 4))
+            comp_n = max(cfg.block_size, (comp_n // cfg.block_size) * cfg.block_size)
+            x = torch.randn(comp_n, device=dev, dtype=dtype)
+            out = torch.empty_like(x)
+            comp_grid = (triton.cdiv(comp_n, cfg.block_size),)
+            fma_flops = comp_n * cfg.compute_iters * _FLOPS_PER_ELEM_PER_ITER
+            compute_desc = f"fma {comp_n // 1_000_000}M elements x{cfg.compute_iters}"
 
         LOGGER.info(
-            "[GPU %d] %s | buffers: %d M elements (%.2f GiB total) | "
-            "compute_iters=%d block=%d",
+            "[GPU %d] %s | backend=%s | compute=%s | mem buffers: %d M elements",
             device,
             torch.cuda.get_device_name(device),
-            n_elements // 1_000_000,
-            (buffer_bytes * 4) / (1024**3),
-            cfg.compute_iters,
-            cfg.block_size,
+            backend,
+            compute_desc,
+            mem_n // 1_000_000,
         )
 
         reference = None
@@ -272,13 +347,17 @@ def _run_on_device(
         while time.time() < deadline and not stop.is_set():
             # --- compute phase -------------------------------------------- #
             start_event.record()
-            _compute_kernel[grid](
-                x, out, n_elements, cfg.compute_iters, BLOCK_SIZE=cfg.block_size
-            )
+            if backend == "helion":
+                out = _helion_matmul(mat_a, mat_b)
+                flops = matmul_flops
+            else:
+                _compute_kernel[comp_grid](
+                    x, out, comp_n, cfg.compute_iters, BLOCK_SIZE=cfg.block_size
+                )
+                flops = fma_flops
             end_event.record()
             end_event.synchronize()
             compute_ms = start_event.elapsed_time(end_event)
-            flops = n_elements * cfg.compute_iters * _FLOPS_PER_ELEM_PER_ITER
             tflops = flops / (compute_ms / 1000.0) / 1e12
             result.last_tflops = tflops
             result.best_tflops = max(result.best_tflops, tflops)
@@ -298,7 +377,7 @@ def _run_on_device(
 
             # --- memory phase --------------------------------------------- #
             start_event.record()
-            _copy_kernel[grid](src, dst, n_elements, BLOCK_SIZE=cfg.block_size)
+            _copy_kernel[mem_grid](src, dst, mem_n, BLOCK_SIZE=cfg.block_size)
             end_event.record()
             end_event.synchronize()
             copy_ms = start_event.elapsed_time(end_event)
@@ -361,10 +440,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fraction of free GPU memory to allocate for the buffers (0-0.95).",
     )
     parser.add_argument(
+        "--compute-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "triton", "helion"],
+        help="Compute kernel backend. 'helion' autotunes a matmul that pushes the "
+        "matrix cores to maximum power draw; 'auto' uses helion when available, "
+        "otherwise the Triton FMA loop.",
+    )
+    parser.add_argument(
         "--compute-iters",
         type=int,
         default=2048,
-        help="Inner FMA-loop iterations per compute kernel launch (higher = more compute bound).",
+        help="Inner FMA-loop iterations per compute kernel launch (higher = more compute bound). Triton backend only.",
     )
     parser.add_argument(
         "--block-size",
@@ -448,9 +536,11 @@ def main(argv: list[str] | None = None) -> int:
         block_size=args.block_size,
         error_check=not args.no_error_check,
         log_interval=args.log_interval,
+        compute_backend=args.compute_backend,
         devices=devices,
     )
 
+    effective_backend = resolve_backend(cfg.compute_backend)
     vendor = detect_vendor()
     LOGGER.info("=" * 72)
     LOGGER.info("Triton GPU stress test")
@@ -459,12 +549,17 @@ def main(argv: list[str] | None = None) -> int:
     LOGGER.info("torch          : %s", torch.__version__)
     LOGGER.info("triton         : %s", getattr(triton, "__version__", "unknown"))
     LOGGER.info(
+        "helion         : %s",
+        getattr(helion, "__version__", "unknown") if _HELION_AVAILABLE else "not installed",
+    )
+    LOGGER.info(
         "cuda/hip       : %s",
         getattr(torch.version, "cuda", None) or getattr(torch.version, "hip", None),
     )
     LOGGER.info("gpus           : %s", devices)
     LOGGER.info("duration       : %s", format_duration(cfg.duration))
     LOGGER.info("mem fraction   : %.2f", cfg.mem_fraction)
+    LOGGER.info("compute backend: %s (requested: %s)", effective_backend, cfg.compute_backend)
     LOGGER.info("error checking : %s", cfg.error_check)
     LOGGER.info("log file       : %s", log_path)
     LOGGER.info("=" * 72)
@@ -510,9 +605,10 @@ def main(argv: list[str] | None = None) -> int:
     for d in devices:
         r = results[d]
         LOGGER.info(
-            "[GPU %d] iterations=%d | best compute=%.1f TFLOP/s | "
+            "[GPU %d] backend=%s | iterations=%d | best compute=%.1f TFLOP/s | "
             "best mem=%.1f GB/s | errors=%d%s",
             d,
+            r.backend,
             r.iterations,
             r.best_tflops,
             r.best_bandwidth,

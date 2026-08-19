@@ -9,3 +9,8 @@
 # it is listed here explicitly for clarity.
 torch
 triton
+# Optional: Helion autotunes a matmul compute phase that drives the matrix cores
+# to maximum power draw. Works on NVIDIA (CUDA) and AMD (ROCm). If it is not
+# installed, the test transparently falls back to the Triton FMA kernel.
+# pip install helion
+
