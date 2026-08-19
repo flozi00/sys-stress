@@ -223,8 +223,14 @@ class StressConfig:
     devices: list[int] = field(default_factory=list)
 
 
-def _run_on_device(device: int, cfg: StressConfig, deadline: float, result: GpuResult):
-    """Continuously stress a single GPU until ``deadline`` is reached."""
+def _run_on_device(
+    device: int,
+    cfg: StressConfig,
+    deadline: float,
+    result: GpuResult,
+    stop: threading.Event,
+):
+    """Continuously stress a single GPU until ``deadline`` or ``stop``."""
     try:
         torch.cuda.set_device(device)
         dev = torch.device(f"cuda:{device}")
@@ -263,7 +269,7 @@ def _run_on_device(device: int, cfg: StressConfig, deadline: float, result: GpuR
         end_event = torch.cuda.Event(enable_timing=True)
         last_log = time.time()
 
-        while time.time() < deadline:
+        while time.time() < deadline and not stop.is_set():
             # --- compute phase -------------------------------------------- #
             start_event.record()
             _compute_kernel[grid](
@@ -476,7 +482,9 @@ def main(argv: list[str] | None = None) -> int:
     threads = []
     for d in devices:
         th = threading.Thread(
-            target=_run_on_device, args=(d, cfg, deadline, results[d]), daemon=True
+            target=_run_on_device,
+            args=(d, cfg, deadline, results[d], stop),
+            daemon=True,
         )
         th.start()
         threads.append(th)
@@ -486,7 +494,9 @@ def main(argv: list[str] | None = None) -> int:
             th.join()
     except KeyboardInterrupt:  # pragma: no cover - interactive
         LOGGER.warning("Interrupted by user, stopping ...")
-        deadline = 0  # signal workers to stop on their next check
+        stop.set()  # signal workers to stop on their next loop check
+        for th in threads:
+            th.join()
 
     stop.set()
     monitor.join(timeout=2)
