@@ -1,0 +1,11 @@
+# For bare-metal / venv usage. The Docker images below already bundle a matching
+# GPU enabled build, so you normally do NOT need this file when using Docker.
+#
+# Pick the wheel index that matches your GPU:
+#   NVIDIA (CUDA 12.x):  pip install torch --index-url https://download.pytorch.org/whl/cu124
+#   AMD    (ROCm 6.x):   pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
+#
+# Triton is pulled in automatically as a dependency of the GPU torch wheels, but
+# it is listed here explicitly for clarity.
+torch
+triton

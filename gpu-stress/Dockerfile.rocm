@@ -1,0 +1,10 @@
+# Triton GPU stress test - AMD / ROCm image.
+# The ROCm PyTorch image ships a ROCm enabled PyTorch + Triton, so the very same
+# gpu_stress.py runs unchanged on AMD GPUs.
+FROM rocm/pytorch:latest
+
+WORKDIR /workspace/gpu-stress
+COPY gpu_stress.py .
+
+ENTRYPOINT ["python3", "gpu_stress.py"]
+CMD ["--duration", "120"]
