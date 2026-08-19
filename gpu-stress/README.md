@@ -30,7 +30,8 @@ For the highest possible load and power consumption, install
 uses an **autotuned matrix multiply** instead of the FP32 FMA loop. A GEMM drives
 the tensor/matrix cores together with the memory subsystem, which is the most
 effective way to push a GPU to its power limit, and Helion autotunes the kernel
-(~10 min on the first run) so it reaches peak throughput on both NVIDIA and AMD.
+(this may take several minutes on the first run, depending on the GPU and matrix
+size) so it reaches peak throughput on both NVIDIA and AMD.
 
 ```bash
 pip install helion

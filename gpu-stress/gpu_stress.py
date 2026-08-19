@@ -119,16 +119,18 @@ _FLOPS_PER_ELEM_PER_ITER = 4
 if _HELION_AVAILABLE:  # pragma: no cover - requires a GPU + helion
 
     @helion.kernel()
-    def _helion_matmul(x: "torch.Tensor", y: "torch.Tensor") -> "torch.Tensor":
+    def _helion_matmul(
+        x: "torch.Tensor", y: "torch.Tensor", out: "torch.Tensor"
+    ) -> "torch.Tensor":
         """Autotuned matmul used to drive the matrix cores at maximum power.
 
         Helion searches hundreds of Triton implementations on the first call and
         keeps the fastest one for the running hardware, so the same source
-        reaches peak throughput on both NVIDIA and AMD GPUs.
+        reaches peak throughput on both NVIDIA and AMD GPUs. The output buffer is
+        passed in and written in place to avoid reallocating it every iteration.
         """
         m, k = x.size()
-        k2, n = y.size()
-        out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+        _, n = y.size()
         for tile_m, tile_n in hl.tile([m, n]):
             acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
             for tile_k in hl.tile(k):
@@ -318,6 +320,7 @@ def _run_on_device(
             n = max(256, (n // 256) * 256)
             mat_a = torch.randn(n, n, device=dev, dtype=dtype)
             mat_b = torch.randn(n, n, device=dev, dtype=dtype)
+            mat_c = torch.empty(n, n, device=dev, dtype=dtype)
             matmul_flops = 2.0 * n * n * n
             compute_desc = f"matmul {n}x{n}"
         else:
@@ -348,7 +351,7 @@ def _run_on_device(
             # --- compute phase -------------------------------------------- #
             start_event.record()
             if backend == "helion":
-                out = _helion_matmul(mat_a, mat_b)
+                out = _helion_matmul(mat_a, mat_b, mat_c)
                 flops = matmul_flops
             else:
                 _compute_kernel[comp_grid](
