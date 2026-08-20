@@ -83,7 +83,9 @@ def _compute_kernel(x_ptr, out_ptr, n_elements, n_iters, BLOCK_SIZE: tl.constexp
 
     Each inner iteration issues two FMA-like operations (4 FLOPs total) that
     depend on the previous result, which keeps the pipeline busy without
-    touching memory.
+    touching memory.  Values are clamped to ``[-2, 2]`` every iteration to
+    prevent float32 overflow (with 2048 iterations the unclamped recurrence
+    would overflow to Inf/NaN, making the self-check meaningless).
     """
     pid = tl.program_id(axis=0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -95,6 +97,8 @@ def _compute_kernel(x_ptr, out_ptr, n_elements, n_iters, BLOCK_SIZE: tl.constexp
     for _ in range(n_iters):
         a = a * b + b
         b = b * a + a
+        a = tl.minimum(tl.maximum(a, -2.0), 2.0)
+        b = tl.minimum(tl.maximum(b, -2.0), 2.0)
     tl.store(out_ptr + offsets, a + b, mask=mask)
 
 
