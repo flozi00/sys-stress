@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # AMD GPU (ROCm) driver + Docker install for the gpu-stress test.
 #
-# Installs the AMDGPU PRO kernel driver + ROCm userspace from the official
+# Installs the AMDGPU DKMS kernel driver + ROCm userspace from the official
 # Radeon repos, installs Docker (matching the NVIDIA install.sh flow), then
 # builds the vendor-neutral Triton gpu-stress image for AMD GPUs.
 #
-# Tested on Ubuntu 24.04 (Noble) with AMD Instinct MI300X. Run as root:
+# Tested on Ubuntu 24.04 (Noble) with an AMD Radeon AI PRO R9700 (RDNA 4,
+# gfx1201).  The ROCm 6.4 image also covers Instinct MI300X/MI325 (gfx942)
+# and other ROCm-supported Radeon and Instinct cards.
+#
+# Run as root:
 #
 #   sudo bash install.sh
 set -euo pipefail
@@ -39,15 +43,16 @@ apt-get update -y
 
 # Install the AMDGPU DKMS kernel driver + ROCm SMI.  amdgpu-dkms brings the
 # up-to-date kernel module and the matching firmware blobs required by recent
-# ASICs (MI300X needs gfx942 firmware that the stock linux-firmware lacks).
-# rocm-smi gives us the SMI command used by the stress test monitor.
+# ASICs (e.g. RDNA 4 / gfx1201 or Instinct gfx942) that the stock
+# linux-firmware may not yet include.  rocm-smi gives us the SMI command used
+# by the stress test monitor.
 apt-get install -y amdgpu-dkms rocm-smi
 
-# Compute/accelerator GPUs (e.g. AMD Instinct MI300X) have no display pipeline.
-# The amdgpu display core (DCN) divide-by-zero crash
+# Some AMD GPUs have no display pipeline, or the amdgpu display core (DCN)
+# crashes with a divide-by-zero during dm_hw_init:
 #   dcn401_get_memclk_states_from_smu ... divide error
-# during dm_hw_init. Disabling the display core avoids this on headless
-# compute cards. Harmless on consumer cards that are also headless.
+# Disabling the display core (amdgpu.dc=0) avoids this on headless cards.
+# Harmless on consumer cards that are also headless (no monitor attached).
 echo "options amdgpu dc=0" > /etc/modprobe.d/amdgpu.conf
 update-initramfs -u -k all
 

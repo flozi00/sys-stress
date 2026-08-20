@@ -14,14 +14,30 @@ CUDA-only `gpu_burn` implementation.
 Each iteration runs two phases on every selected GPU:
 
 - **compute** — a long, register bound fused-multiply-add loop that saturates
-  the FP32 ALUs and reports estimated **TFLOP/s**.
+  the FP32 ALUs.  Values are clamped to `[−2, 2]` every iteration to prevent
+  float32 overflow, keeping the self-check meaningful over long runs.  Reports
+  estimated **TFLOP/s** (tera-operations per second).
 - **memory** — a streaming copy over large buffers that saturates the device
-  memory bus and reports the achieved **GB/s**.
+  memory bus.  Reports the achieved **GB/s** (gigabytes per second of read +
+  write bandwidth).
 
-The compute phase is **self checking**: the first iteration's result is kept as a
-reference and every later iteration is compared against it. Any mismatch (caused
-by overheating, an unstable overclock or faulty hardware) is counted and logged
-as an error, just like the classic `gpu_burn`.
+The compute phase is **self checking**: the first iteration's result is kept
+as a reference and every later iteration is compared against it via a
+checksum.  Any mismatch (caused by overheating, an unstable overclock or faulty
+hardware) is counted and logged as an error, just like the classic `gpu_burn`.
+
+## Metrics explained
+
+| Metric | Unit | What it measures |
+|--------|------|------------------|
+| **compute** | TFLOP/s | Tera floating-point operations per second from the FMA loop. 4 FLOPs per element per inner iteration. |
+| **mem** | GB/s | Achieved device memory bandwidth (read + write) from the streaming copy kernel. |
+| **errors** | count | Number of differing elements detected by the self-check. 0 = clean run. |
+| **iterations** | count | How many complete compute + memory cycles completed during the run. |
+
+Progress is logged to stdout at `--log-interval` seconds (default 10) and to a
+full-system SMI snapshot (temperature, power, utilisation) at
+`--monitor-interval` seconds (default 30).
 
 ## Maximum power draw with Helion (optional)
 
@@ -39,13 +55,8 @@ python3 gpu_stress.py --duration 2h --compute-backend helion
 ```
 
 The backend is selected with `--compute-backend {auto,triton,helion}` (default
-`auto`, which uses Helion when it is importable and otherwise falls back to the
+`auto`, which uses Helion when available and otherwise falls back to the
 Triton FMA kernel). Helion works on NVIDIA (CUDA) and AMD (ROCm) alike.
-
-The test is designed to keep the GPUs at ~100% load for a **configurable**
-amount of time — from minutes to several **days** — to validate cooling and long
-term stability. Progress is streamed to stdout **and** to a timestamped log file
-so a long soak test leaves behind a nice, self contained record.
 
 ## Quick start (Docker)
 
@@ -74,6 +85,12 @@ docker run --rm \
     gpu-stress-rocm --duration 2h
 ```
 
+> **AMD driver note:** The host needs the `amdgpu` kernel driver loaded and
+> `/dev/kfd` + `/dev/dri` present. Run `amd/install.sh` to install the
+> AMDGPU DKMS driver + ROCm and build the image. The `amdgpu.dc=0` modprobe
+> option is set by the install script to avoid a display-core divide-by-zero
+> on headless cards — a reboot is required after the first install.
+
 ## Quick start (bare metal)
 
 Requires a GPU enabled PyTorch + Triton install (see `requirements.txt`).
@@ -81,6 +98,23 @@ Requires a GPU enabled PyTorch + Triton install (see `requirements.txt`).
 ```bash
 python3 gpu_stress.py --duration 30m
 ```
+
+## Duration / time configuration
+
+The `--duration` / `-t` flag controls how long the stress test runs.  It accepts
+a bare number (seconds) or a value with unit suffixes:
+
+| Example | Meaning |
+|--------|---------|
+| `--duration 120` | 120 seconds |
+| `--duration 30m` | 30 minutes |
+| `--duration 2h` | 2 hours |
+| `--duration 3d` | 3 days |
+| `--duration 1h30m` | 1 hour 30 minutes (compound) |
+
+The test runs until the duration elapses, then reports a summary and exits with
+status `0` (all GPUs passed) or non-zero (mismatches or worker failures
+detected).
 
 ## Options
 
@@ -100,6 +134,9 @@ python3 gpu_stress.py --duration 30m
 ## Examples
 
 ```bash
+# 60-second smoke test
+python3 gpu_stress.py --duration 60
+
 # Overnight soak test on all GPUs
 python3 gpu_stress.py --duration 12h
 
@@ -108,6 +145,9 @@ python3 gpu_stress.py --duration 3d --devices 0,1
 
 # Maximum compute pressure
 python3 gpu_stress.py --duration 1h --compute-iters 4096 --mem-fraction 0.9
+
+# Pure compute, skip the self-check (slightly faster)
+python3 gpu_stress.py --duration 1h --no-error-check
 ```
 
 The process exits with status `0` when every GPU passes, and non-zero if any
