@@ -313,10 +313,14 @@ def _run_on_device(
         mem_grid = (triton.cdiv(mem_n, cfg.block_size),)
         buffer_bytes = mem_n * 4
 
-        # Compute phase buffers depend on the backend.
+        # Compute phase buffers depend on the backend.  When error checking is
+        # enabled we also need a `reference` buffer (same size as `out`), so we
+        # reserve room for it to avoid OOM on the first iteration's clone().
         if backend == "helion":
-            # matmul buffers a (n,n), b (n,n), c (n,n): 3 buffers.
-            n = int((compute_budget / (3 * 4)) ** 0.5)
+            # matmul buffers a (n,n), b (n,n), c (n,n): 3 buffers, plus an
+            # optional reference clone of c.
+            n_compute_bufs = 3 + (1 if cfg.error_check else 0)
+            n = int((compute_budget / (n_compute_bufs * 4)) ** 0.5)
             n = max(256, (n // 256) * 256)
             mat_a = torch.randn(n, n, device=dev, dtype=dtype)
             mat_b = torch.randn(n, n, device=dev, dtype=dtype)
@@ -324,8 +328,10 @@ def _run_on_device(
             matmul_flops = 2.0 * n * n * n
             compute_desc = f"matmul {n}x{n}"
         else:
-            # FMA-loop buffers x, out: 2 buffers.
-            comp_n = max(1, compute_budget // (2 * 4))
+            # FMA-loop buffers x, out: 2 buffers, plus an optional reference
+            # clone of out.
+            n_compute_bufs = 2 + (1 if cfg.error_check else 0)
+            comp_n = max(1, compute_budget // (n_compute_bufs * 4))
             comp_n = max(cfg.block_size, (comp_n // cfg.block_size) * cfg.block_size)
             x = torch.randn(comp_n, device=dev, dtype=dtype)
             out = torch.empty_like(x)
