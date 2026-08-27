@@ -87,7 +87,7 @@ def _compute_kernel(x_ptr, out_ptr, n_elements, n_iters, BLOCK_SIZE: tl.constexp
     prevent float32 overflow (with 2048 iterations the unclamped recurrence
     would overflow to Inf/NaN, making the self-check meaningless).
     """
-    pid = tl.program_id(axis=0)
+    pid = tl.program_id(axis=0).to(tl.int64)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
@@ -105,7 +105,7 @@ def _compute_kernel(x_ptr, out_ptr, n_elements, n_iters, BLOCK_SIZE: tl.constexp
 @triton.jit
 def _copy_kernel(src_ptr, dst_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     """Streaming copy used to measure/stress memory bandwidth (read + write)."""
-    pid = tl.program_id(axis=0)
+    pid = tl.program_id(axis=0).to(tl.int64)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
     val = tl.load(src_ptr + offsets, mask=mask)
