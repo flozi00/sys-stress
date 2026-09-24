@@ -43,20 +43,33 @@ Progress is logged to stdout at `--log-interval` seconds (default 10) and to a
 full-system SMI snapshot (temperature, power, utilisation) at
 `--monitor-interval` seconds (default 30).
 
-## Maximum power draw
+## Maximum power & maximum throughput
 
-The default `torch` backend is the max-power path: no extra install needed.
+The default backend is the **FP8 burn** (`auto` → `fp8` on Hopper/Blackwell,
+else `torch`): CUDA-graph replay of `_scaled_mm` FP8 GEMMs mixed 5:1 with BF16
+GEMMs plus FP32→BF16 conversions and an HBM copy phase, on several streams
+per GPU. At startup it **autotunes**:
+
+- the GEMM matrix dimension — it sweeps every candidate that fits the
+  free-VRAM budget (16384…2048), captures a short CUDA graph per candidate
+  and keeps the empirically fastest one (the same idea as Helion's matmul
+  autotuning, at the shape level), and
+- the memory-phase buffer size, scaled to the VRAM left over.
+
+Measured on NVIDIA GB300 (DGX Station, 1300 W): autotune selects 8192²
+(2791 TFLOP/s in-tune), sustains **~2600 TFLOP/s at 1294 W ≈ 99.6 % of the
+power limit** with 0 errors; a pure `_scaled_mm` probe on the same host
+reaches 3588 TFLOP/s (76 % of the 5 PF FP8 dense datasheet figure at the
+1300 W/77 °C operating point).
+
+Tune it with `--burn-streams`, `--burn-replays`, `--mem-fraction`.
+Buffers auto-shrink to fit free VRAM (it also runs alongside a loaded
+inference server — verified at ~1000 TFLOP/s in 5 GB of free VRAM).
 
 ```bash
-python3 gpu_stress.py --duration 2h
+python3 gpu_stress.py --duration 2h            # autotuned fp8 burn
+python3 gpu_stress.py --duration 2h --compute-backend torch   # bf16 burn
 ```
-
-It replays CUDA-graph-captured BF16 GEMMs (tensor/matrix cores) fused with
-FP32 ALU work and HBM copies on several streams per GPU — the combination
-that pushes a card to its power limit (measured ~1290 W of 1300 W on GB300).
-Tune it with `--burn-streams`, `--burn-dim` and `--burn-replays`; buffers
-auto-shrink to fit free VRAM (including alongside a loaded inference
-server). Triton is optional and only used by the legacy backends below.
 
 ### Legacy backends: triton / helion (optional)
 
@@ -136,10 +149,10 @@ detected).
 ```
 -t, --duration          How long to run. Seconds or units: 90, 30m, 2h, 3d, 1h30m (default: 120)
 -m, --mem-fraction      Fraction of free GPU memory to allocate (default: 0.8)
-    --compute-backend   Compute kernel backend: auto, torch, triton, helion (default: auto = torch)
-    --burn-streams      Parallel CUDA streams per GPU for the torch backend (default: 4)
-    --burn-dim          Matrix dim for the torch backend, auto-shrunk to fit VRAM (default: 8192)
-    --burn-replays      GEMM+ALU+copy replays per CUDA graph, torch backend (default: 20)
+    --compute-backend   Compute kernel backend: auto, torch, fp8, triton, helion (default: auto = fp8 when _scaled_mm works, else torch)
+    --burn-streams      Parallel CUDA streams per GPU for the torch/fp8 backends (default: 4)
+    --burn-dim          Matrix dim for the torch backend, auto-shrunk to fit VRAM (default: 8192). fp8 backend autotunes the dim
+    --burn-replays      GEMM+ALU+copy replays per CUDA graph (default: 20)
     --compute-iters     Inner FMA-loop iterations per launch, higher = more compute bound. Triton backend only (default: 2048)
     --block-size        Triton block size in elements. Triton backend only (default: 1024)
     --devices           Comma separated GPU indices, or 'all' (default: all)

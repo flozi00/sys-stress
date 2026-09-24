@@ -309,10 +309,306 @@ def resolve_backend(requested: str) -> str:
             )
             return "torch"
         return "triton"
-    # "auto": the pure-torch CUDA-graph burn backend is the default. It drives
-    # tensor cores + ALU + HBM together with no compiler toolchain needed and
-    # reaches the card power limit (proven 1295/1300W on GB300).
+    if requested == "fp8":
+        return "fp8"
+    # "auto": the FP8 torch burn if the hardware supports _scaled_mm,
+    # otherwise the BF16 torch burn. Both need no Triton/gcc toolchain
+    # and reach the card power limit.
+    if torch.cuda.is_available():
+        try:
+            _probe = torch.zeros(64, 64, device="cuda", dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            )
+            _probe_t = _probe.t().contiguous().t()
+            _s = torch.tensor(1.0, device="cuda")
+            torch._scaled_mm(_probe, _probe_t, scale_a=_s, scale_b=_s)
+            return "fp8"
+        except Exception:
+            pass
     return "torch"
+
+
+def _has_fp8_scaled_mm(device) -> bool:
+    """True if torch._scaled_mm fp8 works on this device/build."""
+    try:
+        probe = torch.zeros(32, 32, device=device, dtype=torch.float32).to(
+            torch.float8_e4m3fn
+        )
+        probe_t = probe.t().contiguous().t()
+        s = torch.tensor(1.0, device=device)
+        out = torch._scaled_mm(probe, probe_t, scale_a=s, scale_b=s)
+        del probe, probe_t, s, out
+        return True
+    except Exception:
+        return False
+
+
+def _autotune_fp8_dim(
+    device: int,
+    dev,
+    cfg: StressConfig,
+    n_streams: int,
+) -> tuple[int, list]:
+    """Autotune the matrix dim for the fp8 burn: sweep candidate dims that
+    fit the free-VRAM budget, benchmark each with a short CUDA-graph replay
+    and return (best_n, prepared_buffers) for the winner.
+
+    This mirrors what Helion does for its matmul kernel, but at the GEMM
+    shape level: the fastest achievable TFLOP/s on this silicon is found
+    empirically instead of assuming one fixed size.
+    """
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    budget = int(free_bytes * max(0.05, min(cfg.mem_fraction, 0.95)))
+    # Per stream the buffers are n^2-sized: fa/fb fp8 (2*n^2 B) + fc bf16
+    # (2*n^2) + fa_f32/fb_f32 (8*n^2) + sa/sb/sc bf16 (6*n^2) = 18*n^2
+    # bytes, plus cuBLAS workspace headroom.
+    max_n = int((budget / (n_streams * 18.0)) ** 0.5 // 64 * 64)
+    candidates = [
+        c
+        for c in (16384, 12288, 8192, 7168, 6144, 5120, 4096, 3072, 2048)
+        if c <= max_n
+    ]
+    if not candidates:
+        candidates = [min(1024, max_n)]
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed_all(1234)
+    s = torch.tensor(1.0, device=dev)
+    one = torch.ones((), device=dev)
+
+    def make_buffers(n):
+        fa = torch.randn(n, n, device=dev).to(torch.float8_e4m3fn)
+        fb = torch.randn(n, n, device=dev).to(torch.float8_e4m3fn).t().contiguous().t()
+        fc = torch.empty(n, n, device=dev, dtype=torch.bfloat16)
+        fa_f32 = torch.randn(n, n, device=dev, dtype=torch.float32)
+        fb_f32 = torch.randn(n, n, device=dev, dtype=torch.float32)
+        sa = torch.randn(n, n, device=dev, dtype=torch.bfloat16)
+        sb = torch.randn(n, n, device=dev, dtype=torch.bfloat16)
+        sc = torch.empty(n, n, device=dev, dtype=torch.bfloat16)
+        return fa, fb, fc, fa_f32, fb_f32, sa, sb, sc
+
+    best_n, best_tflops, best_bufs = -1, -1.0, None
+    with torch.no_grad():
+        for cand in candidates:
+            try:
+                bufs = [make_buffers(cand) for _ in range(n_streams)]
+                torch.cuda.synchronize(device)
+                # Warmup so cuBLAS picks its fastest algorithm before capture.
+                for (fa, fb, fc, fa_f32, fb_f32, sa, sb, sc) in bufs:
+                    for _ in range(3):
+                        torch._scaled_mm(fa, fb, scale_a=s, scale_b=s, out_dtype=torch.bfloat16)
+                        torch.mm(sa, sb, out=sc)
+                    fc.copy_(fa_f32.to(torch.bfloat16))
+                torch.cuda.synchronize(device)
+                # Capture one repeat unit: 5 fp8 GEMMs + 1 bf16 GEMM (drives
+                # both fp8 and bf16 tensor-core paths, filling wave tail).
+                reps = max(2, min(8, cfg.burn_replays))
+                graphs = []
+                for (fa, fb, fc, fa_f32, fb_f32, sa, sb, sc) in bufs:
+                    st = torch.cuda.Stream(device=device)
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.stream(st), torch.cuda.graph(g):
+                        for i in range(reps):
+                            for _ in range(5):
+                                torch._scaled_mm(fa, fb, scale_a=s, scale_b=s, out_dtype=torch.bfloat16)
+                            torch.mm(sa, sb, out=sc)
+                            if i % 4 == 3:
+                                fa_f32.to(torch.bfloat16)
+                                fb_f32.to(torch.bfloat16)
+                    graphs.append((st, g))
+                # Bench: 3 timed replays, all streams.
+                torch.cuda.synchronize(device)
+                t0 = time.perf_counter()
+                for _ in range(3):
+                    for st, g in graphs:
+                        with torch.cuda.stream(st):
+                            g.replay()
+                    torch.cuda.synchronize(device)
+                ms = (time.perf_counter() - t0) / 3 * 1000.0
+                # FLOPs per graph: reps*(5 fp8 + 1 bf16) gemms of 2n^3.
+                flops = reps * 6 * 2.0 * cand**3 * n_streams
+                tflops = flops / (ms / 1000.0) / 1e12
+                LOGGER.info(
+                    "[GPU %d] autotune fp8 dim=%d: %.0f TFLOP/s (budget max n=%d)",
+                    device, cand, tflops, max_n,
+                )
+                if tflops > best_tflops:
+                    if best_bufs is not None:
+                        del best_bufs
+                    best_n, best_tflops, best_bufs = cand, tflops, bufs
+                else:
+                    del bufs
+                for st, g in graphs:
+                    del g
+                torch.cuda.empty_cache()
+            except torch.OutOfMemoryError:
+                del bufs
+                torch.cuda.empty_cache()
+                continue
+    if best_bufs is None:
+        raise torch.OutOfMemoryError("autotune could not fit any fp8 candidate")
+    del s, one
+    return best_n, best_bufs
+
+
+def _run_fp8_burn(
+    device: int,
+    cfg: StressConfig,
+    deadline: float,
+    result: GpuResult,
+    stop: threading.Event,
+):
+    """FP8 tensor-core burn (max TFLOP/s on modern NVIDIA silicon).
+
+    Uses torch._scaled_mm (cuBLASLt fp8) GEMMs mixed 5:1 with BF16 GEMMs so
+    both fp8 and bf16 tensor-core pipelines stay busy, plus periodic fp32→
+    bf16 conversions for HBM traffic. The matrix dim is autotuned at start
+    (see _autotune_fp8_dim). No Triton/gcc needed; requires a GPU + torch
+    build with working _scaled_mm (Hopper/Blackwell), else falls back to the
+    bf16 torch burn.
+    """
+    result.backend = "fp8"
+    try:
+        torch.cuda.set_device(device)
+        dev = torch.device(f"cuda:{device}")
+        if not _has_fp8_scaled_mm(dev):
+            LOGGER.warning(
+                "[GPU %d] fp8 backend selected but _scaled_mm unavailable; "
+                "falling back to bf16 torch burn",
+                device,
+            )
+            _run_torch_burn(device, cfg, deadline, result, stop)
+            return
+        n_streams = max(1, cfg.burn_streams)
+        reps = max(2, min(8, cfg.burn_replays))
+
+        n, streams_bufs = _autotune_fp8_dim(device, dev, cfg, n_streams)
+        s = torch.tensor(1.0, device=dev)
+
+        # Autotuned memory phase: a dedicated alternating-buffers copy sweep
+        # (src->dst, alt->src) keeps read+write channels saturated. Buffers
+        # sized from the VRAM left after the GEMM buffers, capped.
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        mem_budget = int(free_bytes * max(0.05, min(cfg.mem_fraction, 0.95)) * 0.5)
+        mem_elems = max(1, mem_budget // (3 * 4))
+        mem_elems = min(mem_elems, (4 * 2**30) // 4)  # cap 4 GiB per buffer
+        if cfg.mem_fraction >= 0.15 and mem_elems > 1024:
+            ms_src = torch.randn(mem_elems, device=dev, dtype=torch.float32)
+            ms_dst = torch.empty_like(ms_src)
+            ms_alt = torch.randn(mem_elems, device=dev, dtype=torch.float32)
+            mem_bytes = mem_elems * 4
+        else:
+            ms_src = ms_dst = ms_alt = None
+            mem_bytes = 0
+        torch.cuda.synchronize(device)
+
+        # Warmup again with the winning buffers (freed the graphs above).
+        with torch.no_grad():
+            for (fa, fb, fc, fa_f32, fb_f32, sa, sb, sc) in streams_bufs:
+                for _ in range(3):
+                    torch._scaled_mm(fa, fb, scale_a=s, scale_b=s, out_dtype=torch.bfloat16)
+                    torch.mm(sa, sb, out=sc)
+            torch.cuda.synchronize(device)
+
+            graphs = []
+            for (fa, fb, fc, fa_f32, fb_f32, sa, sb, sc) in streams_bufs:
+                st = torch.cuda.Stream(device=device)
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.stream(st), torch.cuda.graph(g):
+                    for i in range(reps):
+                        for _ in range(5):
+                            torch._scaled_mm(fa, fb, scale_a=s, scale_b=s, out_dtype=torch.bfloat16)
+                        torch.mm(sa, sb, out=sc)
+                        if i % 4 == 3:
+                            fa_f32.to(torch.bfloat16)
+                            fb_f32.to(torch.bfloat16)
+                graphs.append((st, g))
+
+            # Reference checksums from one replay: the captured chain is a
+            # pure function of its fixed inputs, so any later divergence is
+            # a real compute error.
+            for st, g in graphs:
+                with torch.cuda.stream(st):
+                    g.replay()
+            torch.cuda.synchronize(device)
+            ref_sums = [
+                (bufs[2].float().sum().item(), bufs[6].float().sum().item())
+                for bufs in streams_bufs
+            ]
+
+        flops_per_round = reps * 6 * 2.0 * n * n * n * n_streams
+        # Approx HBM+L2 bytes per round: each 5xfp8+1xbf16 unit reads fa/fb
+        # (fp8) and sa/sb (bf16) once per gemm while fc/sc/sa/sb rewrite in
+        # place => ~ (5*2 + 6*2/round + conv 12/4th iter) * n^2.
+        bytes_per_round = reps * (10.0 + 12.0 + 3.0) * n * n * n_streams
+        LOGGER.info(
+            "[GPU %d] %s | backend=fp8 | %dx (5xfp8+1xbf16) gemm %dx%d + "
+            "fp32->bf16 conversions | %d streams",
+            device, torch.cuda.get_device_name(device), reps, n, n, n_streams,
+        )
+
+        last_log = time.time()
+        local_iters = 0
+        with torch.no_grad():
+            while time.time() < deadline and not stop.is_set():
+                # Device-wide sync timing (CUDA events don't track the
+                # non-blocking per-stream graphs). Phases are timed
+                # separately so each metric reflects its own subsystem,
+                # not an amortized blend.
+                torch.cuda.synchronize(device)
+                t_start = time.perf_counter()
+                for st, g in graphs:
+                    with torch.cuda.stream(st):
+                        g.replay()
+                torch.cuda.synchronize(device)
+                t_gemm = time.perf_counter()
+                # Memory phase: alternating copies saturate read+write HBM.
+                if ms_src is not None:
+                    ms_dst.copy_(ms_src)
+                    ms_src.copy_(ms_alt)
+                    torch.cuda.synchronize(device)
+                    t_mem = time.perf_counter()
+                    gemm_ms = max((t_gemm - t_start) * 1000.0, 1e-3)
+                    mem_ms = max((t_mem - t_gemm) * 1000.0, 1e-3)
+                    # 2 copies x read+write of the buffer bytes.
+                    bw = (2.0 * 2.0 * mem_bytes) / (mem_ms / 1000.0) / 1e9
+                else:
+                    t_mem = time.perf_counter()
+                    gemm_ms = max((t_gemm - t_start) * 1000.0, 1e-3)
+                    mem_ms = 0.0
+                    bw = bytes_per_round / (gemm_ms / 1000.0) / 1e9
+                tflops = flops_per_round / (gemm_ms / 1000.0) / 1e12
+                result.last_tflops = tflops
+                result.best_tflops = max(result.best_tflops, tflops)
+                result.last_bandwidth = bw
+                result.best_bandwidth = max(result.best_bandwidth, bw)
+                local_iters += 1
+                result.iterations = local_iters
+
+                if cfg.error_check and (local_iters & 7) == 0:
+                    for i, bufs in enumerate(streams_bufs):
+                        cs = (bufs[2].float().sum().item(), bufs[6].float().sum().item())
+                        if cs != ref_sums[i]:
+                            result.errors += 1
+                            LOGGER.error(
+                                "[GPU %d] computation mismatch on stream %d!",
+                                device, i,
+                            )
+                            ref_sums[i] = cs
+
+                now = time.time()
+                if now - last_log >= cfg.log_interval:
+                    remaining = max(0.0, deadline - now)
+                    LOGGER.info(
+                        "[GPU %d] iter=%d | compute=%.1f TFLOP/s | mem=%.1f GB/s | "
+                        "errors=%d | remaining=%s",
+                        device, result.iterations, tflops, bw, result.errors,
+                        format_duration(remaining),
+                    )
+                    last_log = now
+    except Exception as exc:  # pragma: no cover - hardware dependent
+        result.failed = True
+        result.message = str(exc)
+        LOGGER.exception("[GPU %d] worker crashed: %s", device, exc)
 
 
 def _run_torch_burn(
@@ -523,6 +819,9 @@ def _run_on_device(
     if backend == "torch":
         _run_torch_burn(device, cfg, deadline, result, stop)
         return
+    if backend == "fp8":
+        _run_fp8_burn(device, cfg, deadline, result, stop)
+        return
     if not _TRITON_AVAILABLE:
         result.failed = True
         result.message = "triton backend selected but triton is not importable"
@@ -701,11 +1000,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--compute-backend",
         type=str,
         default="auto",
-        choices=["auto", "triton", "helion", "torch"],
-        help="Compute kernel backend. 'torch' is the pure-torch CUDA-graph burn "
-        "(tensor cores + ALU + HBM, no compiler needed, reaches the power "
-        "limit); 'auto' selects torch. 'helion'/'triton' need a working "
-        "Triton/gcc toolchain.",
+        choices=["auto", "torch", "fp8", "triton", "helion"],
+        help="Compute kernel backend. 'fp8' burns fp8+bf16 tensor cores via "
+        "_scaled_mm with an autotuned GEMM size (max TFLOP/s on "
+        "Hopper/Blackwell); 'auto' picks fp8 when available, else 'torch'. "
+        "'torch' is the bf16 CUDA-graph burn; 'triton'/'helion' need a "
+        "working Triton/gcc toolchain.",
     )
     parser.add_argument(
         "--compute-iters",
