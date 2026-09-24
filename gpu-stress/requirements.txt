@@ -5,12 +5,11 @@
 #   NVIDIA (CUDA 12.x):  pip install torch --index-url https://download.pytorch.org/whl/cu124
 #   AMD    (ROCm 6.x):   pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
 #
-# Triton is pulled in automatically as a dependency of the GPU torch wheels, but
-# it is listed here explicitly for clarity.
+# Triton is optional: only needed for the legacy `triton` / `helion`
+# backends. The default `torch` backend needs nothing but torch itself.
 torch
-triton
-# Optional: Helion autotunes a matmul compute phase that drives the matrix cores
-# to maximum power draw. Works on NVIDIA (CUDA) and AMD (ROCm). If it is not
-# installed, the test transparently falls back to the Triton FMA kernel.
+# triton
+# Optional: Helion autotunes a matmul compute phase for the legacy `helion`
+# backend. Works on NVIDIA (CUDA) and AMD (ROCm).
 # pip install helion
 

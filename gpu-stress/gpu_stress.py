@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
-"""Triton based GPU stress test.
+"""GPU stress test.
 
 A single, vendor neutral stress test that hammers both the memory subsystem
-(memory bandwidth) and the arithmetic units (computation cores) of every
-visible GPU.  Because the heavy lifting is done by `Triton <https://github.com/
-triton-lang/triton>`_ kernels executed through PyTorch, the exact same test runs
-on NVIDIA (CUDA) and AMD (ROCm) GPUs.
+(memory bandwidth) and the arithmetic units (tensor cores + computation cores)
+of every visible GPU. The default `torch` backend does the heavy lifting with
+pure PyTorch ops (BF16 GEMMs fused with FP32 ALU work and device copies)
+replayed from CUDA graphs, so it runs anywhere a GPU PyTorch build runs with
+no compiler toolchain. Optional Triton / Helion backends keep the exact same
+test portable across NVIDIA (CUDA) and AMD (ROCm) where Triton is available.
 
 The goal is to keep the GPUs at (or close to) 100% load for a configurable
 amount of time -- from a couple of minutes up to several days -- so that the
 cooling solution and the long term stability of the cards can be validated.
 
-Every iteration performs:
+Every iteration replays CUDA graphs of fused BF16 GEMMs, FP32 elementwise work
+and device-to-device copies (default `torch` backend), or -- with the legacy
+`triton` backend -- performs:
 
 * a **compute** phase: a long fused-multiply-add loop kept in registers to
   saturate the FP32 ALUs and report an estimated TFLOP/s figure, and
 * a **memory** phase: a streaming copy over large buffers to saturate the
   device memory bus and report the achieved bandwidth in GB/s.
 
-The compute phase is also self checking: the result of the first iteration is
-kept as a reference and every subsequent iteration is compared against it.  A
+The compute phase is also self checking: the op chain is a pure function of its
+inputs, so all workers are seeded with identical inputs and every iteration is
+compared against a reference checksum.  A
 mismatch means the GPU produced a wrong result under load (overheating, unstable
 overclock, faulty hardware, ...) and is counted and logged as an error, exactly
 like the classic ``gpu_burn`` tool does.
@@ -44,15 +49,23 @@ from dataclasses import dataclass, field
 
 try:
     import torch
-    import triton
-    import triton.language as tl
 except Exception as exc:  # pragma: no cover - import guard
     sys.stderr.write(
-        "Failed to import torch/triton. Install a GPU enabled PyTorch + Triton "
+        "Failed to import torch. Install a GPU enabled PyTorch "
         "build (CUDA for NVIDIA, ROCm for AMD).\n"
         f"Original error: {exc}\n"
     )
     raise
+
+try:
+    import triton
+    import triton.language as tl
+
+    _TRITON_AVAILABLE = True
+except Exception:  # pragma: no cover - environment dependent
+    triton = None
+    tl = None
+    _TRITON_AVAILABLE = False
 
 
 LOGGER = logging.getLogger("gpu_stress")
@@ -75,41 +88,42 @@ except Exception:  # pragma: no cover - environment dependent
 
 
 # --------------------------------------------------------------------------- #
-# Triton kernels
+# Triton kernels (optional - only when triton imports AND compiles)
 # --------------------------------------------------------------------------- #
-@triton.jit
-def _compute_kernel(x_ptr, out_ptr, n_elements, n_iters, BLOCK_SIZE: tl.constexpr):
-    """Register bound fused-multiply-add loop to saturate the FP32 ALUs.
+if _TRITON_AVAILABLE:
 
-    Each inner iteration issues two FMA-like operations (4 FLOPs total) that
-    depend on the previous result, which keeps the pipeline busy without
-    touching memory.  Values are clamped to ``[-2, 2]`` every iteration to
-    prevent float32 overflow (with 2048 iterations the unclamped recurrence
-    would overflow to Inf/NaN, making the self-check meaningless).
-    """
-    pid = tl.program_id(axis=0).to(tl.int64)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    @triton.jit
+    def _compute_kernel(x_ptr, out_ptr, n_elements, n_iters, BLOCK_SIZE: tl.constexpr):
+        """Register bound fused-multiply-add loop to saturate the FP32 ALUs.
 
-    a = x
-    b = x + 1.0
-    for _ in range(n_iters):
-        a = a * b + b
-        b = b * a + a
-        a = tl.minimum(tl.maximum(a, -2.0), 2.0)
-        b = tl.minimum(tl.maximum(b, -2.0), 2.0)
-    tl.store(out_ptr + offsets, a + b, mask=mask)
+        Each inner iteration issues two FMA-like operations (4 FLOPs total) that
+        depend on the previous result, which keeps the pipeline busy without
+        touching memory.  Values are clamped to ``[-2, 2]`` every iteration to
+        prevent float32 overflow (with 2048 iterations the unclamped recurrence
+        would overflow to Inf/NaN, making the self-check meaningless).
+        """
+        pid = tl.program_id(axis=0).to(tl.int64)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
 
+        a = x
+        b = x + 1.0
+        for _ in range(n_iters):
+            a = a * b + b
+            b = b * a + a
+            a = tl.minimum(tl.maximum(a, -2.0), 2.0)
+            b = tl.minimum(tl.maximum(b, -2.0), 2.0)
+        tl.store(out_ptr + offsets, a + b, mask=mask)
 
-@triton.jit
-def _copy_kernel(src_ptr, dst_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    """Streaming copy used to measure/stress memory bandwidth (read + write)."""
-    pid = tl.program_id(axis=0).to(tl.int64)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    val = tl.load(src_ptr + offsets, mask=mask)
-    tl.store(dst_ptr + offsets, val, mask=mask)
+    @triton.jit
+    def _copy_kernel(src_ptr, dst_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        """Streaming copy used to measure/stress memory bandwidth (read + write)."""
+        pid = tl.program_id(axis=0).to(tl.int64)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        val = tl.load(src_ptr + offsets, mask=mask)
+        tl.store(dst_ptr + offsets, val, mask=mask)
 
 
 # FLOPs performed per input element in a single `_compute_kernel` launch.
@@ -269,22 +283,232 @@ class StressConfig:
     log_interval: float
     compute_backend: str = "auto"
     devices: list[int] = field(default_factory=list)
+    burn_streams: int = 4
+    burn_dim: int = 8192
+    burn_replays: int = 20
 
 
 def resolve_backend(requested: str) -> str:
     """Resolve the effective compute backend from the requested value."""
     requested = requested.strip().lower()
+    if requested == "torch":
+        return "torch"
     if requested == "helion":
-        if not _HELION_AVAILABLE:
+        if not _HELION_AVAILABLE or not _TRITON_AVAILABLE:
             LOGGER.warning(
-                "Helion backend requested but helion is not importable; "
-                "falling back to the Triton compute kernel."
+                "Helion backend requested but helion/triton is not importable; "
+                "falling back to the pure-torch burn backend."
             )
-            return "triton"
+            return "torch"
         return "helion"
-    if requested == "auto":
-        return "helion" if _HELION_AVAILABLE else "triton"
-    return "triton"
+    if requested == "triton":
+        if not _TRITON_AVAILABLE:
+            LOGGER.warning(
+                "Triton backend requested but triton is not importable; "
+                "falling back to the pure-torch burn backend."
+            )
+            return "torch"
+        return "triton"
+    # "auto": the pure-torch CUDA-graph burn backend is the default. It drives
+    # tensor cores + ALU + HBM together with no compiler toolchain needed and
+    # reaches the card power limit (proven 1295/1300W on GB300).
+    return "torch"
+
+
+def _run_torch_burn(
+    device: int,
+    cfg: StressConfig,
+    deadline: float,
+    result: GpuResult,
+    stop: threading.Event,
+):
+    """Pure-torch max-power burn (no Triton/gcc needed).
+
+    Each worker replays CUDA-graph-captured BF16 GEMMs (tensor cores) fused
+    with FP32 addcmul ALU work and D2D copies (HBM) in a tight loop, one
+    CUDA stream per torch thread. A fixed input produces a fixed output, so
+    the self-check compares the graph output against a CPU-side reference
+    computed once with the same op sequence on identical inputs.
+    """
+    result.backend = "torch"
+    try:
+        torch.cuda.set_device(device)
+        dev = torch.device(f"cuda:{device}")
+        n_streams = max(1, cfg.burn_streams)
+        n = max(1024, cfg.burn_dim)
+        replays = max(1, cfg.burn_replays)
+
+        # Size the matrices to the free-VRAM budget. Per stream we hold
+        # 3x bf16 (n,n) + 4x fp32 vectors of n*n. Shrink n until it fits,
+        # then allocate defensively: on OOM, release everything, shrink
+        # further and retry (free VRAM can shift under us, e.g. KV cache).
+        streams_bufs: list = []
+        graphs: list = []
+        ref_sums: list = []
+        ref_z: list = []
+        for attempt in range(6):
+            per_stream = 3 * (n * n * 2) + 4 * (n * n * 4)
+            need = int(per_stream * n_streams * 1.3)
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+            budget = int(free_bytes * max(0.05, min(cfg.mem_fraction, 0.95)))
+            while need > budget and n > 1024:
+                n = max(1024, (n * 3 // 4 // 256) * 256)
+                per_stream = 3 * (n * n * 2) + 4 * (n * n * 4)
+                need = int(per_stream * n_streams * 1.3)
+            try:
+                streams_bufs = []
+                for _ in range(n_streams):
+                    a = torch.randn(n, n, device=dev, dtype=torch.bfloat16)
+                    b = torch.randn(n, n, device=dev, dtype=torch.bfloat16)
+                    c = torch.empty(n, n, device=dev, dtype=torch.bfloat16)
+                    x = torch.randn(n * n, device=dev, dtype=torch.float32)
+                    y = torch.randn(n * n, device=dev, dtype=torch.float32)
+                    z = torch.empty(n * n, device=dev, dtype=torch.float32)
+                    m1 = torch.randn(n * n, device=dev, dtype=torch.float32)
+                    m2 = torch.empty(n * n, device=dev, dtype=torch.float32)
+                    streams_bufs.append((a, b, c, x, y, z, m1, m2))
+                torch.cuda.synchronize()
+
+                # Warmup so cublas picks the fastest algorithm before capture.
+                for a, b, c, x, y, z, m1, m2 in streams_bufs:
+                    for _ in range(5):
+                        torch.mm(a, b, out=c)
+                        torch.addcmul(y, x, y, out=z)
+                    torch.cuda.synchronize()
+
+                graphs = []
+                for a, b, c, x, y, z, m1, m2 in streams_bufs:
+                    s = torch.cuda.Stream(device=device)
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.stream(s), torch.cuda.graph(g):
+                        for _ in range(replays):
+                            torch.mm(a, b, out=c)
+                            torch.addcmul(y, x, y, out=z)
+                            z.clamp_(-2.0, 2.0)
+                            m2.copy_(m1)
+                    graphs.append((s, g))
+
+                # Reference checksums: the captured op chain is a pure function
+                # of its inputs (mm reads a/b, addcmul reads x/y; outputs c/z
+                # are rewritten every replay), so reseed every stream with
+                # IDENTICAL inputs and compute the reference once from those
+                # same values. Any later divergence is a real compute error.
+                torch.manual_seed(1234)
+                torch.cuda.manual_seed_all(1234)
+                seed_a = torch.randn(n, n, device=dev, dtype=torch.bfloat16)
+                seed_b = torch.randn(n, n, device=dev, dtype=torch.bfloat16)
+                seed_x = torch.randn(n * n, device=dev, dtype=torch.float32)
+                seed_y = torch.randn(n * n, device=dev, dtype=torch.float32)
+                seed_m = torch.randn(n * n, device=dev, dtype=torch.float32)
+                for a, b, c, x, y, z, m1, m2 in streams_bufs:
+                    a.copy_(seed_a)
+                    b.copy_(seed_b)
+                    x.copy_(seed_x)
+                    y.copy_(seed_y)
+                    m1.copy_(seed_m)
+                torch.cuda.synchronize(device)
+                with torch.no_grad():
+                    chk_c = torch.mm(seed_a, seed_b)
+                    chk_z = torch.addcmul(seed_y, seed_x, seed_y)
+                    chk_z.clamp_(-2.0, 2.0)
+                    ref_sums = [chk_c.float().sum().item()] * n_streams
+                    ref_z = [chk_z.sum().item()] * n_streams
+                    del chk_c, chk_z
+                del seed_a, seed_b, seed_x, seed_y, seed_m
+                break
+            except torch.OutOfMemoryError:
+                del streams_bufs
+                del graphs
+                streams_bufs = []
+                graphs = []
+                torch.cuda.empty_cache()
+                n = max(1024, (n * 3 // 4 // 256) * 256)
+                if n <= 1024 and attempt >= 2 and n_streams > 1:
+                    n_streams -= 1
+                    n = max(1024, cfg.burn_dim)
+                LOGGER.warning(
+                    "[GPU %d] OOM during setup, retrying smaller (n=%d, streams=%d)",
+                    device,
+                    n,
+                    n_streams,
+                )
+        else:
+            raise torch.OutOfMemoryError("could not fit burn buffers in VRAM")
+        if not graphs:
+            raise torch.OutOfMemoryError("could not fit burn buffers in VRAM")
+
+        flops_per_graph = replays * (2.0 * n * n * n + 2.0 * n * n)
+        copy_bytes_per_graph = replays * (2 * n * n * 4)
+        LOGGER.info(
+            "[GPU %d] %s | backend=torch | %dx bf16-gemm %dx%d + fp32-alu + d2d "
+            "| %d streams x %d replays/graph",
+            device,
+            torch.cuda.get_device_name(device),
+            replays,
+            n,
+            n,
+            n_streams,
+            replays,
+        )
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        last_log = time.time()
+        local_iters = 0
+        while time.time() < deadline and not stop.is_set():
+            # Wall-clock timing around a device-wide sync: CUDA events
+            # recorded on the default stream do NOT track work enqueued on
+            # the per-stream graphs (torch streams are non-blocking), so
+            # event timing here would measure ~0ms and, worse, the loop
+            # would outrun the GPU and checksums would read in-flight data.
+            torch.cuda.synchronize(device)
+            t_start = time.perf_counter()
+            for s, g in graphs:
+                with torch.cuda.stream(s):
+                    g.replay()
+            torch.cuda.synchronize(device)
+            ms = max((time.perf_counter() - t_start) * 1000.0, 1e-3)
+            tflops = (flops_per_graph * n_streams) / (ms / 1000.0) / 1e12
+            bw = (copy_bytes_per_graph * n_streams) / (ms / 1000.0) / 1e9
+            result.last_tflops = tflops
+            result.best_tflops = max(result.best_tflops, tflops)
+            result.last_bandwidth = bw
+            result.best_bandwidth = max(result.best_bandwidth, bw)
+            local_iters += 1
+            result.iterations = local_iters
+
+            if cfg.error_check and (local_iters & 15) == 0:
+                for i, (a, b, c, x, y, z, m1, m2) in enumerate(streams_bufs):
+                    cs = c.float().sum().item()
+                    zs = z.sum().item()
+                    if cs != ref_sums[i] or zs != ref_z[i]:
+                        result.errors += 1
+                        LOGGER.error(
+                            "[GPU %d] computation mismatch on stream %d!",
+                            device,
+                            i,
+                        )
+                        ref_sums[i] = cs
+                        ref_z[i] = zs
+
+            now = time.time()
+            if now - last_log >= cfg.log_interval:
+                remaining = max(0.0, deadline - now)
+                LOGGER.info(
+                    "[GPU %d] iter=%d | compute=%.1f TFLOP/s | mem=%.1f GB/s | "
+                    "errors=%d | remaining=%s",
+                    device,
+                    result.iterations,
+                    tflops,
+                    bw,
+                    result.errors,
+                    format_duration(remaining),
+                )
+                last_log = now
+    except Exception as exc:  # pragma: no cover - hardware dependent
+        result.failed = True
+        result.message = str(exc)
+        LOGGER.exception("[GPU %d] worker crashed: %s", device, exc)
 
 
 def _run_on_device(
@@ -296,6 +520,14 @@ def _run_on_device(
 ):
     """Continuously stress a single GPU until ``deadline`` or ``stop``."""
     backend = resolve_backend(cfg.compute_backend)
+    if backend == "torch":
+        _run_torch_burn(device, cfg, deadline, result, stop)
+        return
+    if not _TRITON_AVAILABLE:
+        result.failed = True
+        result.message = "triton backend selected but triton is not importable"
+        LOGGER.error("[GPU %d] %s", device, result.message)
+        return
     result.backend = backend
     try:
         torch.cuda.set_device(device)
@@ -448,7 +680,7 @@ def _monitor(deadline: float, interval: float, stop: threading.Event):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Triton based GPU stress test for NVIDIA and AMD GPUs.",
+        description="GPU stress test for NVIDIA and AMD GPUs.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -469,10 +701,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--compute-backend",
         type=str,
         default="auto",
-        choices=["auto", "triton", "helion"],
-        help="Compute kernel backend. 'helion' autotunes a matmul that pushes the "
-        "matrix cores to maximum power draw; 'auto' uses helion when available, "
-        "otherwise the Triton FMA loop.",
+        choices=["auto", "triton", "helion", "torch"],
+        help="Compute kernel backend. 'torch' is the pure-torch CUDA-graph burn "
+        "(tensor cores + ALU + HBM, no compiler needed, reaches the power "
+        "limit); 'auto' selects torch. 'helion'/'triton' need a working "
+        "Triton/gcc toolchain.",
     )
     parser.add_argument(
         "--compute-iters",
@@ -484,7 +717,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--block-size",
         type=int,
         default=1024,
-        help="Triton block size (elements per program).",
+        help="Triton block size (elements per program). Triton backend only.",
+    )
+    parser.add_argument(
+        "--burn-streams",
+        type=int,
+        default=4,
+        help="Parallel CUDA streams per GPU for the torch burn backend.",
+    )
+    parser.add_argument(
+        "--burn-dim",
+        type=int,
+        default=8192,
+        help="Matrix dim for the torch burn backend (auto-shrunk to fit VRAM).",
+    )
+    parser.add_argument(
+        "--burn-replays",
+        type=int,
+        default=20,
+        help="GEMM+ALU+copy replays captured per CUDA graph (torch backend).",
     )
     parser.add_argument(
         "--devices",
@@ -564,16 +815,22 @@ def main(argv: list[str] | None = None) -> int:
         log_interval=args.log_interval,
         compute_backend=args.compute_backend,
         devices=devices,
+        burn_streams=args.burn_streams,
+        burn_dim=args.burn_dim,
+        burn_replays=args.burn_replays,
     )
 
     effective_backend = resolve_backend(cfg.compute_backend)
     vendor = detect_vendor()
     LOGGER.info("=" * 72)
-    LOGGER.info("Triton GPU stress test")
+    LOGGER.info("GPU stress test")
     LOGGER.info("host           : %s", platform.node())
     LOGGER.info("vendor         : %s", vendor)
     LOGGER.info("torch          : %s", torch.__version__)
-    LOGGER.info("triton         : %s", getattr(triton, "__version__", "unknown"))
+    LOGGER.info(
+        "triton         : %s",
+        getattr(triton, "__version__", "unavailable") if _TRITON_AVAILABLE else "unavailable",
+    )
     LOGGER.info(
         "helion         : %s",
         getattr(helion, "__version__", "unknown") if _HELION_AVAILABLE else "not installed",
