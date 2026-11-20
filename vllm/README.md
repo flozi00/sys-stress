@@ -9,6 +9,7 @@ export VLLM_HOST=user@host          # never committed
 ./serve.sh --gpu 1                  # start detached, pinned to nvidia-smi index 1
 ./wait_ready.sh                     # block until /health answers
 ./smoke.sh                          # one real chat completion
+./bench_serving.sh                  # TTFT + decode rate at concurrency 1/4/8
 ```
 
 ## Why the GPU is pinned
@@ -45,6 +46,16 @@ copy the cache to the other machines instead of pulling 475 GiB per host:
 ```bash
 rsync -a --info=progress2 ~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017 \
       other-host:~/.cache/huggingface/hub/
+```
+
+## Measuring it
+
+`bench_serving.py` streams real requests and reports time-to-first-token,
+per-stream decode rate and aggregate output tokens/s. Stdlib only, so it runs
+on the GPU host without installing anything:
+
+```bash
+VLLM_CONCURRENCY="1 8 24" ./bench_serving.sh
 ```
 
 ## Checking on it
