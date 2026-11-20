@@ -1,1 +1,7 @@
 vllm-results/
+
+# benchmark outputs and local host configuration (never commit hosts/IPs)
+bench/results/
+results/
+*.local
+.env

@@ -42,3 +42,21 @@ unstable overclock, faulty hardware) is counted and logged as an error.
 
 See [`gpu-stress/README.md`](gpu-stress/README.md) for full options, the
 duration / time format (`30m`, `2h`, `3d`, …), and bare-metal instructions.
+
+### Hardware benchmarks (FLOPS, bandwidth, interconnect)
+
+`gpu-stress` answers "does it stay stable for days?".  [`bench/`](bench/README.md)
+answers "how fast is it, really?" — HBM/GDDR bandwidth (read, write, copy,
+triad), GEMM peak per precision (fp32, tf32, bf16, fp16, fp8, fp4), host↔device
+bandwidth (NVLink-C2C or PCIe), P2P copies, CPU STREAM, and the power/clock
+point each number was measured at.
+
+```bash
+export SYS_STRESS_HOST=user@host   # never committed
+cd bench
+./bootstrap_remote.sh              # one-time: uv + venv + torch
+./run_remote.sh all                # full report into ./results/
+```
+
+The target host is read from `SYS_STRESS_HOST` only; no hostnames, IPs or
+credentials live in this repository.

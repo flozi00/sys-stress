@@ -1,0 +1,4 @@
+# Install with the CUDA wheel index for the matching driver, e.g.
+#   uv pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu130
+torch>=2.9
+nvidia-ml-py>=12.535   # fast power/clock sampling (falls back to nvidia-smi)
