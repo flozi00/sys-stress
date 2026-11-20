@@ -59,7 +59,14 @@ def stream_once(base_url: str, model: str, max_tokens: int, timeout: float) -> d
             if event.get("usage"):
                 usage = event["usage"]
             choices = event.get("choices") or []
-            if choices and choices[0].get("delta", {}).get("content"):
+            delta = choices[0].get("delta", {}) if choices else {}
+            # A reasoning model streams its thinking first and only switches
+            # to `content` when the answer starts.  This build names the
+            # thinking field `reasoning`; other servers use
+            # `reasoning_content`.  All of them are output tokens, so all of
+            # them count for TTFT and the decode rate.
+            if (delta.get("content") or delta.get("reasoning")
+                    or delta.get("reasoning_content")):
                 if first is None:
                     first = time.perf_counter()
                 chunks += 1
