@@ -36,7 +36,10 @@ Find the right index with `nvidia-smi -L`.
 ## Sizing
 
 The checkpoint is ~475 GiB across 48 shards, so the first start downloads for
-a while (the HF cache is bind-mounted from `~/.cache/huggingface`). Two engram
+a while (the HF cache is bind-mounted from `~/.cache/huggingface`).
+`VLLM_ENGINE_READY_TIMEOUT_S` is measured from process start, so the stock
+3600 s kills the frontend mid-download on a cold cache — `serve.sh` defaults
+it to 14400 s. A restart resumes the download instead of starting over. Two engram
 tables of 94 GiB each plus 61 GiB of offloaded parameters live in host RAM —
 budget ~400 GiB RSS on a 744 GiB machine.
 

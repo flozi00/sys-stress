@@ -18,6 +18,9 @@ PORT="${VLLM_PORT:-8000}"
 IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:latest}"
 NAME="${VLLM_NAME:-deepseek-v41-flash}"
 GPU="${VLLM_GPU:-0}"
+# The first start downloads ~475 GiB.  The stock 3600 s is measured from
+# process start, so a cold cache kills the frontend mid-download.
+READY_TIMEOUT="${VLLM_ENGINE_READY_TIMEOUT_S:-14400}"
 DETACH=1
 
 while [ $# -gt 0 ]; do
@@ -46,7 +49,7 @@ docker run ${MODE} \\
   --gpus "device=${GPU}" \\
   --privileged --ipc=host -p ${PORT}:8000 \\
   -v "\${HOME}/.cache/huggingface:/root/.cache/huggingface" \\
-  -e VLLM_ENGINE_READY_TIMEOUT_S=3600 \\
+  -e VLLM_ENGINE_READY_TIMEOUT_S=${READY_TIMEOUT} \\
   -e VLLM_USE_RUST_FRONTEND=1 \\
   ${IMAGE} ${MODEL} \\
   --tokenizer-mode deepseek_v41 \\
