@@ -134,6 +134,7 @@ def _timed_loop(fn: Callable[[], Any], min_seconds: float = 3.0,
     single = max(start.elapsed_time(end) / 1000.0, 1e-6)
     iters = max(1, int((min_seconds / repeats) / single))
 
+    target = min_seconds / repeats
     samples: list[float] = []
     for _ in range(repeats):
         start.record()
@@ -141,7 +142,15 @@ def _timed_loop(fn: Callable[[], Any], min_seconds: float = 3.0,
             fn()
         end.record()
         torch.cuda.synchronize()
-        samples.append(start.elapsed_time(end) / 1000.0 / iters)
+        elapsed = start.elapsed_time(end) / 1000.0
+        samples.append(elapsed / iters)
+        # The single-iteration calibration runs at boost clock with a cold L2,
+        # so it can be 2-3x faster than the sustained rate.  Without this the
+        # block overruns its budget, the phase drags on and the power average
+        # picks up idle tail.  Re-derive the iteration count from what the
+        # block actually took.
+        if elapsed > 1.5 * target:
+            iters = max(1, int(iters * target / elapsed))
     return min(samples), statistics.median(samples), iters
 
 
@@ -259,7 +268,11 @@ class PowerSampler:
         """
         start = mark
         if skip_seconds > 0 and len(self.samples["t"]) > mark:
-            cutoff = self.samples["t"][mark] + skip_seconds
+            # Skip the ramp, and never less than a quarter of the window: a
+            # phase that overran its budget would otherwise average in the
+            # idle tail and report a fraction of the real power.
+            window = self.samples["t"][-1] - self.samples["t"][mark]
+            cutoff = self.samples["t"][mark] + max(skip_seconds, 0.25 * window)
             start = next((i for i in range(mark, len(self.samples["t"]))
                           if self.samples["t"][i] >= cutoff), mark)
             if len(self.samples["power"]) - start < 2:  # phase too short to trim
