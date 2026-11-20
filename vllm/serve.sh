@@ -60,6 +60,7 @@ docker run ${MODE} \\
   --gpus "device=${GPU}" \\
   --ipc=host -p ${PORT}:8000 \\
   -v "\${HOME}/.cache/huggingface:/root/.cache/huggingface" \\
+  -v "\${HOME}/.cache/flashinfer:/root/.cache/flashinfer" \\
   -e VLLM_ENGINE_READY_TIMEOUT_S=${READY_TIMEOUT} \\
   -e VLLM_USE_RUST_FRONTEND=1 \\
   ${IMAGE} ${MODEL} \\
