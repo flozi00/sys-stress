@@ -21,6 +21,12 @@ GPU="${VLLM_GPU:-0}"
 # The first start downloads ~475 GiB.  The stock 3600 s is measured from
 # process start, so a cold cache kills the frontend mid-download.
 READY_TIMEOUT="${VLLM_ENGINE_READY_TIMEOUT_S:-14400}"
+# moe_backend='auto' benchmarks the candidates at startup and picks the
+# fastest.  The choice is not stable across machines: on one station the
+# autotuner picked deep_gemm and the first forward pass died in
+# fp8_einsum (layout.hpp:51, t.dim() == N), while flashinfer_trtllm ran
+# fine.  Pin it so every station serves the same kernels.
+MOE_BACKEND="${VLLM_MOE_BACKEND:-flashinfer_trtllm}"
 DETACH=1
 
 while [ $# -gt 0 ]; do
@@ -70,6 +76,7 @@ docker run ${MODE} \\
   --enable-auto-tool-choice \\
   --reasoning-parser deepseek_v41 \\
   --mm-encoder-tp-mode data \\
+  --moe-backend ${MOE_BACKEND} \\
   --speculative-config '{"method":"dspark","num_speculative_tokens":5,"num_speculative_tokens_per_batch_size":[[1,4,5],[5,24,1]]}' \\
   ${VLLM_EXTRA_ARGS:-}
 REMOTE

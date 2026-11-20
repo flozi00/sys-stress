@@ -32,6 +32,24 @@ Find the right index with `nvidia-smi -L`.
 | `--attention-config FLASHMLA_MEGA_ATTN_DSV41` | Sparse MLA backend for this architecture |
 | `--speculative-config dspark` | 5 speculative tokens, fewer at larger batch sizes |
 | `--max-model-len 1048576` | 1M context |
+| `--moe-backend flashinfer_trtllm` | Pins the MoE kernel — see below |
+
+## Why the MoE backend is pinned
+
+`moe_backend` defaults to `auto`: vLLM benchmarks the candidate kernels at
+startup and keeps the fastest. That choice is not stable across identical
+stations. On one GB300 the autotuner picked `deep_gemm` and the very first
+forward pass — the dummy run inside `determine_available_memory` — died with
+
+```
+RuntimeError: Assertion error (layout.hpp:51): t.dim() == N
+  flash_mla_mega_attn.py:307 _o_proj -> fp8_einsum
+```
+
+while the same image on the same GPU model, started with the same flags,
+picked `flashinfer_trtllm` and served normally. Pinning the backend makes the
+fleet reproducible and keeps the comparison between stations honest.
+Override with `VLLM_MOE_BACKEND=deep_gemm` if you want the other path.
 
 ## Sizing
 
