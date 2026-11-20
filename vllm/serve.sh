@@ -32,6 +32,15 @@ if [ -n "${MOE_BACKEND}" ]; then MOE_ARG="--moe-backend ${MOE_BACKEND}"; fi
 # there.  Off by default for bring-up; set VLLM_FLASHINFER_AUTOTUNE=1 for
 # final performance numbers.
 FI_AUTOTUNE="${VLLM_FLASHINFER_AUTOTUNE:-0}"
+# The checkpoint leaves ~10 GiB of the 249 GiB card for everything else, so
+# the upstream 1M context does not fit: one max-length request needs 1.89 GiB
+# of KV cache and only 0.62 GiB is left after the model, activations and
+# CUDA graphs.  256k needs 0.47 GiB and fits with room to spare (17.5 GiB of
+# KV cache).  Raise VLLM_MAX_MODEL_LEN once the autotune is on: it leaves
+# ~24 GiB of KV cache and the full 1M works.
+MAX_BATCHED="${VLLM_MAX_BATCHED_TOKENS:-4096}"
+MEM_UTIL="${VLLM_GPU_MEM_UTIL:-0.99}"
+MAX_LEN="${VLLM_MAX_MODEL_LEN:-262144}"
 FI_ARG=""
 if [ "${FI_AUTOTUNE}" = "0" ]; then FI_ARG="--no-enable-flashinfer-autotune"; fi
 # No --privileged: it mounts every /dev/nvidia* node and voids the
@@ -76,9 +85,9 @@ docker run ${MODE} \\
   --cpu-offload-gb 60 \\
   --cpu-offload-params routed_experts.w13_weight routed_experts.w2_weight \\
   --engram-config '{"cpu_offload":true}' \\
-  --gpu-memory-utilization 0.97 \\
-  --max-model-len 1048576 \\
-  --max-num-batched-tokens 8192 \\
+  --gpu-memory-utilization ${MEM_UTIL} \\
+  --max-model-len ${MAX_LEN} \\
+  --max-num-batched-tokens ${MAX_BATCHED} \\
   --long-prefill-token-threshold 6144 \\
   --compilation-config '{"cudagraph_capture_sizes":[1,2,4,6,8,12,16,18,24,32,40,48,64,96,128]}' \\
   --tensor-parallel-size 1 \\
