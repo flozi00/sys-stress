@@ -27,6 +27,13 @@ READY_TIMEOUT="${VLLM_ENGINE_READY_TIMEOUT_S:-14400}"
 MOE_BACKEND="${VLLM_MOE_BACKEND:-}"
 MOE_ARG=""
 if [ -n "${MOE_BACKEND}" ]; then MOE_ARG="--moe-backend ${MOE_BACKEND}"; fi
+# FlashInfer autotune profiles every GEMM at every token bucket during
+# warmup: hundreds of shapes, ~1 min each, so a cold start spends hours
+# there.  Off by default for bring-up; set VLLM_FLASHINFER_AUTOTUNE=1 for
+# final performance numbers.
+FI_AUTOTUNE="${VLLM_FLASHINFER_AUTOTUNE:-0}"
+FI_ARG=""
+if [ "${FI_AUTOTUNE}" = "0" ]; then FI_ARG="--no-enable-flashinfer-autotune"; fi
 # No --privileged: it mounts every /dev/nvidia* node and voids the
 # --gpus device= restriction.  On a chassis with a second card the
 # container then sees two devices, vLLM detects the wrong compute
@@ -82,7 +89,7 @@ docker run ${MODE} \\
   --enable-auto-tool-choice \\
   --reasoning-parser deepseek_v41 \\
   --mm-encoder-tp-mode data \\
-  ${MOE_ARG} \\
+  ${MOE_ARG} ${FI_ARG} \\
   --speculative-config '{"method":"dspark","num_speculative_tokens":5,"num_speculative_tokens_per_batch_size":[[1,4,5],[5,24,1]]}' \\
   ${VLLM_EXTRA_ARGS:-}
 REMOTE
