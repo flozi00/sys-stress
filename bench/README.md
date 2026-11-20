@@ -125,6 +125,22 @@ Peaks used for the percentage column (dense, i.e. non-sparse):
   300 W.  NVIDIA publishes no dense FP8/BF16/TF32 figures for this SKU, so
   those rows are reported without a percentage.
 
+## Two traps that make a healthy card look slow
+
+**Power averaging over the ramp.** A GB300 needs about a second to go from
+idle to its sustained clock. Averaging that ramp into a 3 s phase understates
+power by 40 % or more — it made a card sitting at its 1300 W limit report
+550 W. `PowerSampler.since()` therefore drops the first second of every phase
+(`skip_seconds=1.0`) and samples at 0.25 s.
+
+**Module power budget.** On Grace-Blackwell the GPU shares a power budget with
+the CPU and memory. `nvidia-smi` reports the GPU limit (1300 W) *and* a module
+limit; if the platform caps the module below its default (e.g. 1250 W instead
+of 1600 W), the GPU stops at ~1125 W and looks 12 % slower than an identical
+card in another chassis. The suite records `module_power_limit_w` /
+`module_power_default_w` and the report calls it out. Same VBIOS, same board
+part number, different platform setting.
+
 ## Reading the numbers
 
 * **HBM copy/triad** should land at 75–90 % of the datasheet bandwidth with

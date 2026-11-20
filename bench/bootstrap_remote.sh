@@ -22,7 +22,9 @@ uv --version
 if [ ! -x "\$HOME/bench-venv/bin/python" ]; then
     uv venv "\$HOME/bench-venv" --python 3.12
 fi
-uv pip install --python "\$HOME/bench-venv/bin/python" torch nvidia-ml-py --index-url ${TORCH_INDEX}
+uv pip install --python "\$HOME/bench-venv/bin/python" torch --index-url ${TORCH_INDEX}
+# nvidia-ml-py lives on PyPI, not in the torch wheel index.
+uv pip install --python "\$HOME/bench-venv/bin/python" nvidia-ml-py numpy
 "\$HOME/bench-venv/bin/python" - <<'PY'
 import torch
 print("torch", torch.__version__, "cuda", torch.version.cuda,

@@ -168,11 +168,11 @@ class PowerSampler:
 
     FIELDS = "uuid,power.draw,temperature.gpu,clocks.sm,utilization.gpu"
 
-    def __init__(self, uuid: str | None = None, interval: float = 0.5) -> None:
+    def __init__(self, uuid: str | None = None, interval: float = 0.25) -> None:
         self.uuid = uuid
         self.interval = interval
         self.samples: dict[str, list[float]] = {
-            "power": [], "temp": [], "clock": [], "util": []
+            "power": [], "temp": [], "clock": [], "util": [], "t": []
         }
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -232,6 +232,7 @@ class PowerSampler:
                 self.samples["temp"].append(temp)
                 self.samples["clock"].append(clock)
                 self.samples["util"].append(util)
+                self.samples["t"].append(time.monotonic())
             self._stop.wait(self.interval)
 
     def __enter__(self) -> "PowerSampler":
@@ -248,21 +249,35 @@ class PowerSampler:
         """Index of the next sample; use with :meth:`since` for per-phase stats."""
         return len(self.samples["power"])
 
-    def since(self, mark: int) -> dict[str, float]:
-        """Summary of the samples collected after ``mark``."""
-        power = self.samples["power"][mark:]
+    def since(self, mark: int, skip_seconds: float = 1.0) -> dict[str, float]:
+        """Summary of the samples collected after ``mark``.
+
+        The first ``skip_seconds`` of a phase are dropped: a GB300 needs about
+        a second to ramp from idle to its sustained clock, and averaging that
+        ramp in understates power by 40 % or more (it made a card that sits at
+        its 1300 W limit look like it drew 550 W).
+        """
+        start = mark
+        if skip_seconds > 0 and len(self.samples["t"]) > mark:
+            cutoff = self.samples["t"][mark] + skip_seconds
+            start = next((i for i in range(mark, len(self.samples["t"]))
+                          if self.samples["t"][i] >= cutoff), mark)
+            if len(self.samples["power"]) - start < 2:  # phase too short to trim
+                start = mark
+        power = self.samples["power"][start:]
         if not power:
             return {}
         return {
             "power_avg_w": round(statistics.fmean(power), 1),
             "power_max_w": round(max(power), 1),
-            "temp_max_c": round(max(self.samples["temp"][mark:]), 1),
-            "clock_avg_mhz": round(statistics.fmean(self.samples["clock"][mark:]), 0),
-            "util_avg_pct": round(statistics.fmean(self.samples["util"][mark:]), 1),
+            "temp_max_c": round(max(self.samples["temp"][start:]), 1),
+            "clock_avg_mhz": round(statistics.fmean(self.samples["clock"][start:]), 0),
+            "util_avg_pct": round(statistics.fmean(self.samples["util"][start:]), 1),
+            "samples": len(power),
         }
 
     def summary(self) -> dict[str, float]:
-        return self.since(0)
+        return self.since(0, skip_seconds=0.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -295,6 +310,43 @@ def _nvml_gpus() -> list[dict[str, Any]]:
         except ValueError:
             continue
     return gpus
+
+
+def _module_power(target: str) -> dict[str, float]:
+    """Module-level power budget (GPU + CPU + memory on Grace-Blackwell).
+
+    A module limit below its default is the usual reason a GB300 stops at
+    ~1125 W although its own limit says 1300 W: the platform caps the whole
+    module, and the CPU/memory share comes out of the same budget.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "-i", target, "-q", "-d", "POWER"],
+            capture_output=True, text=True, timeout=10, check=False,
+        ).stdout
+    except Exception:
+        return {}
+    parts = out.split("Module Power Readings")
+    if len(parts) < 2:
+        return {}
+    values: dict[str, float] = {}
+    for line in parts[1].splitlines()[1:]:
+        if ":" not in line:
+            break
+        key, _, raw = line.partition(":")
+        key = key.strip().lower()
+        token = raw.strip().split()[0] if raw.strip() else ""
+        try:
+            value = float(token)
+        except ValueError:
+            continue
+        if key.startswith("current power limit"):
+            values["module_power_limit_w"] = value
+        elif key.startswith("default power limit"):
+            values["module_power_default_w"] = value
+        elif key.startswith("instantaneous power draw"):
+            values["module_power_draw_w"] = value
+    return values
 
 
 def device_info(index: int, uuid: str | None = None,
@@ -332,6 +384,7 @@ def device_info(index: int, uuid: str | None = None,
         ).stdout.strip())
     except Exception:
         pass
+    info.update(_module_power(target))
     info["datasheet"] = datasheet_for(props.name)
     return info
 

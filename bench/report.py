@@ -380,6 +380,7 @@ def summary_section(report: dict[str, Any], t: dict[str, str]) -> str:
         row(f'{t["interconnect"]} · {t["h2d"]} (GB/s)', link("h2d")),
         row(f'{t["interconnect"]} · {t["d2h"]} (GB/s)', link("d2h")),
         row("Power max (W)", lambda g: num(g.get("power", {}).get("power_max_w"), 0)),
+        row("Modul-Budget (W)", lambda g: num(g["info"].get("module_power_limit_w"), 0)),
     ]
     return f"""
 <h2>{esc(t['summary'])}</h2>
@@ -402,6 +403,11 @@ def gpu_section(gpu: dict[str, Any], t: dict[str, str]) -> str:
     ]
     if info.get("clock_max_mhz"):
         facts.append(f'Max. SM-Takt {num(info["clock_max_mhz"], 0)} MHz')
+    module_limit = info.get("module_power_limit_w")
+    module_default = info.get("module_power_default_w")
+    if module_limit and module_default and module_limit < module_default - 1:
+        facts.append(f'Modul-Budget {num(module_limit, 0)} W '
+                     f'(Standard {num(module_default, 0)} W)')
     head = f"""
 <div class="pagebreak"></div>
 <div class="gpu-head">
@@ -526,6 +532,20 @@ def build_observations(gpu: dict[str, Any], t: dict[str, str]) -> list[str]:
 
     power = gpu.get("power", {})
     limit = info.get("power_limit_w")
+    module_limit = info.get("module_power_limit_w")
+    module_default = info.get("module_power_default_w")
+    if module_limit and module_default and module_limit < module_default - 1:
+        out.append(
+            f"Das Modul-Power-Budget ist auf {num(module_limit, 0)} W begrenzt "
+            f"(Standard {num(module_default, 0)} W). GPU, CPU und Speicher teilen "
+            f"sich dieses Budget, deshalb kann die Karte ihr eigenes Limit von "
+            f"{num(limit, 0)} W nicht ausschöpfen"
+            + (f" und bleibt bei {num(power['power_max_w'], 0)} W stehen"
+               if power else "")
+            + ". Derselbe Kartentyp erreicht in einem Chassis mit vollem Budget "
+              "spürbar mehr Durchsatz; die Ursache liegt im Platform-Setup "
+              "(Netzteil-/BMC-Konfiguration), nicht in der GPU."
+        )
     if power and limit:
         ratio = 100.0 * power["power_max_w"] / limit
         if ratio >= 97:
