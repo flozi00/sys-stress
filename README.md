@@ -56,6 +56,7 @@ export SYS_STRESS_HOST=user@host   # never committed
 cd bench
 ./bootstrap_remote.sh              # one-time: uv + venv + torch
 ./run_remote.sh all                # full report into ./results/
+./run_remote.sh --pdf all          # same, plus a PDF report
 ```
 
 The target host is read from `SYS_STRESS_HOST` only; no hostnames, IPs or

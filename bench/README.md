@@ -30,6 +30,7 @@ The target host is **never** stored in this repository.  Export it per session:
 export SYS_STRESS_HOST=user@host          # ssh target
 ./bootstrap_remote.sh                     # one-time: uv + venv + torch
 ./run_remote.sh all                       # full suite, JSON into ./results/
+./run_remote.sh --pdf all                 # same, plus a PDF report
 ```
 
 `run_remote.sh` rsyncs this directory to `~/sys-stress-bench` on the target,
@@ -44,6 +45,42 @@ Optional environment variables:
 | `SYS_STRESS_REMOTE_DIR` | `sys-stress-bench` | working directory on the target |
 | `SYS_STRESS_PYTHON` | `~/bench-venv/bin/python` | interpreter on the target |
 | `SYS_STRESS_TORCH_INDEX` | `https://download.pytorch.org/whl/cu130` | wheel index for bootstrap |
+
+## PDF report
+
+`report.py` turns a JSON result into a fixed-layout document (A4) that can be
+sent to a customer: cover block, host table, cross-GPU summary, one page per
+GPU with achieved-vs-datasheet bars, observations, methodology and sources.
+
+```bash
+python3 report.py results/bench-*.json -o report.pdf \
+    --title "DGX Station — GPU Benchmark" \
+    --subtitle "Leistungsmessung FLOPS, Speicherbandbreite und Interconnect" \
+    --operator "primeLine Solutions GmbH"
+```
+
+Or let the runner do it:
+
+```bash
+export SYS_STRESS_REPORT_TITLE="DGX Station — GPU Benchmark"
+export SYS_STRESS_REPORT_SUBTITLE="Kunde / Projekt"
+export SYS_STRESS_REPORT_OPERATOR="primeLine Solutions GmbH"
+./run_remote.sh --pdf all
+```
+
+Options: `--lang de|en` (default `de`), `--notes "…"` for a free-text
+paragraph, `--html-only` to skip PDF conversion.  The HTML is always written
+next to the PDF.
+
+PDF conversion uses **WeasyPrint** (real page numbers via CSS paged media),
+then **headless Chrome**, then **wkhtmltopdf** — whichever is installed.  No
+Python dependencies beyond the standard library.
+
+The report derives its findings from the data, not from a template: it states
+the share of datasheet peak per metric, whether the card hit its power limit,
+the sustained clock versus the maximum, and the peak temperature.  Missing
+datasheet figures (NVIDIA publishes no dense FP8/BF16/TF32 numbers for the
+RTX PRO 6000 Max-Q) are shown as "kein Dense-Wert" rather than guessed.
 
 ## Direct usage on the machine
 

@@ -8,11 +8,20 @@
 #
 # Then:
 #
-#   ./run_remote.sh all --json results.json
+#   ./run_remote.sh all
 #   ./run_remote.sh compute --gpu 1 --dtype bf16 fp8
+#   ./run_remote.sh --pdf all          # also render a PDF report
 #
-# Results are copied back into ./results/ (git-ignored).
+# Results are copied back into ./results/ (git-ignored).  Report metadata can
+# be set with SYS_STRESS_REPORT_TITLE / _SUBTITLE / _OPERATOR.
 set -euo pipefail
+
+# Optional first argument: --pdf renders a report from the fetched JSON.
+REPORT=0
+if [ "${1:-}" = "--pdf" ]; then
+    REPORT=1
+    shift
+fi
 
 : "${SYS_STRESS_HOST:?Set SYS_STRESS_HOST to the ssh target (user@host). It is intentionally not stored in the repo.}"
 REMOTE_DIR="${SYS_STRESS_REMOTE_DIR:-sys-stress-bench}"
@@ -36,3 +45,13 @@ echo ">> fetching JSON report"
 scp -q "${SYS_STRESS_HOST}:${REMOTE_DIR}/results-${STAMP}.json" \
     "${OUT_DIR}/bench-${STAMP}.json"
 echo ">> done: ${OUT_DIR}/bench-${STAMP}.json"
+
+if [ "${REPORT}" = "1" ]; then
+    echo ">> rendering PDF report"
+    python3 "${LOCAL_DIR}/report.py" "${OUT_DIR}/bench-${STAMP}.json" \
+        -o "${OUT_DIR}/bench-${STAMP}.pdf" \
+        ${SYS_STRESS_REPORT_TITLE:+--title "${SYS_STRESS_REPORT_TITLE}"} \
+        ${SYS_STRESS_REPORT_SUBTITLE:+--subtitle "${SYS_STRESS_REPORT_SUBTITLE}"} \
+        ${SYS_STRESS_REPORT_OPERATOR:+--operator "${SYS_STRESS_REPORT_OPERATOR}"}
+    echo ">> done: ${OUT_DIR}/bench-${STAMP}.pdf"
+fi

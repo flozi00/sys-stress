@@ -324,6 +324,14 @@ def device_info(index: int, uuid: str | None = None,
         ).stdout.strip().splitlines()[0]
     except Exception:
         pass
+    try:
+        info["clock_max_mhz"] = float(subprocess.run(
+            ["nvidia-smi", "-i", target, "--query-gpu=clocks.max.sm",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5, check=False,
+        ).stdout.strip())
+    except Exception:
+        pass
     info["datasheet"] = datasheet_for(props.name)
     return info
 
@@ -346,6 +354,8 @@ def cpu_info() -> dict[str, Any]:
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "threads": torch.get_num_threads(),
+        "kernel": platform.release(),
+        "os": f"{platform.system()} {platform.release()} ({platform.machine()})",
     }
     try:
         with open("/proc/cpuinfo", encoding="utf-8") as fh:
