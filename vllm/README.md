@@ -32,24 +32,37 @@ Find the right index with `nvidia-smi -L`.
 | `--attention-config FLASHMLA_MEGA_ATTN_DSV41` | Sparse MLA backend for this architecture |
 | `--speculative-config dspark` | 5 speculative tokens, fewer at larger batch sizes |
 | `--max-model-len 1048576` | 1M context |
-| `--moe-backend flashinfer_trtllm` | Pins the MoE kernel — see below |
 
-## Why the MoE backend is pinned
+## Why there is no `--privileged`
 
-`moe_backend` defaults to `auto`: vLLM benchmarks the candidate kernels at
-startup and keeps the fastest. That choice is not stable across identical
-stations. On one GB300 the autotuner picked `deep_gemm` and the very first
-forward pass — the dummy run inside `determine_available_memory` — died with
+The upstream `docker run` recipe uses `--privileged`. On a chassis with a
+second card that silently breaks GPU pinning: `--privileged` mounts every
+`/dev/nvidia*` node, so the container sees both GPUs even though
+`--gpus device=1` was given. vLLM then detects the *other* card's compute
+capability — 12.0 (RTX PRO 6000) instead of 10.3 (GB300) — and rejects every
+sm_100 kernel. The visible symptom is a MoE backend error:
 
 ```
-RuntimeError: Assertion error (layout.hpp:51): t.dim() == N
-  flash_mla_mega_attn.py:307 _o_proj -> fp8_einsum
+ValueError: Mxfp4 MoE backend 'FLASHINFER_TRTLLM_MXFP4_MXFP8' does not
+support the deployment configuration since kernel does not support
+current device cuda.
 ```
 
-while the same image on the same GPU model, started with the same flags,
-picked `flashinfer_trtllm` and served normally. Pinning the backend makes the
-fleet reproducible and keeps the comparison between stations honest.
-Override with `VLLM_MOE_BACKEND=deep_gemm` if you want the other path.
+With `moe_backend=auto` the autotuner then falls back to `deep_gemm`, whose
+first forward pass dies in `fp8_einsum` (`layout.hpp:51, t.dim() == N`). On a
+single-GPU station the same flags work, which makes the failure look like a
+flaky autotuner choice rather than a device-visibility bug.
+
+`--ipc=host` is all the server needs. Verify the container sees one device:
+
+```bash
+ssh "$VLLM_HOST" 'docker exec deepseek-v41-flash python3 -c \
+  "import torch; print(torch.cuda.device_count(), torch.cuda.get_device_capability(0))"'
+# expect: 1 (10, 3)
+```
+
+`VLLM_MOE_BACKEND` still forces a specific backend when you want to compare
+kernels rather than machines.
 
 ## Sizing
 
