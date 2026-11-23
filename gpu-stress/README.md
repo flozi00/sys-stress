@@ -62,13 +62,40 @@ power limit** with 0 errors; a pure `_scaled_mm` probe on the same host
 reaches 3588 TFLOP/s (76 % of the 5 PF FP8 dense datasheet figure at the
 1300 W/77 °C operating point).
 
+Measured on an **HGX B300 (8× B300 SXM6 AC, 1100 W cap)**: 2286–2366 TFLOP/s
+sustained per GPU at **1090–1092 W of 1100 W (99.1–99.3 %)**, 6.04–6.10 TB/s
+HBM copy (78.5–79.2 % of the 7.7 TB/s datasheet peak), 65–72 °C, 0 errors —
+**8729 W of 8800 W (99.2 %) across all eight GPUs** with `--burn-dim 16384`.
+`--gemm-mix 6:0` (pure FP8) reaches 2645–2781 TFLOP/s at the same power, and
+the NVLink fabric moves 758–761 GB/s per pair in every direction. See
+[`docs/8-gpu-dgx-hgx-stress.md`](../docs/8-gpu-dgx-hgx-stress.md) for the full
+8-GPU runbook (fabric manager, error 802, acceptance gates).
+
 Tune it with `--burn-streams`, `--burn-replays`, `--mem-fraction`.
 Buffers auto-shrink to fit free VRAM (it also runs alongside a loaded
 inference server — verified at ~1000 TFLOP/s in 5 GB of free VRAM).
 
+### Power reporting and the power gate
+
+Every worker samples its GPU through NVML (0.25 s interval) and reports the
+**sustained compute-phase power** next to the throughput — ramp excluded, so
+the number is the power point the card actually held:
+
+```
+[GPU 0] backend=fp8 | iterations=11530 | compute=2280 TFLOP/s sustained (best 2854) | mem=6133 GB/s sustained (best 6347) | errors=0
+    power: sustained 1088 W of 1100 W (98.9%) | peak 1093 W | 71 C | SM 1172 MHz | util 100%
+    bandwidth: 79.6% of the 7700 GB/s datasheet HBM peak
+system: sustained GPU power 8690 W of 8800 W (98.8%) across 8 GPUs
+```
+
+`--min-power-fraction 0.95` turns that into an acceptance criterion: the run
+exits non-zero when any card stays below 95 % of its power limit, which is the
+difference between "the test ran" and "the card was actually stressed".
+
 ```bash
 python3 gpu_stress.py --duration 2h            # autotuned fp8 burn
 python3 gpu_stress.py --duration 2h --compute-backend torch   # bf16 burn
+python3 gpu_stress.py --duration 2h --min-power-fraction 0.95 # burn-in gate
 ```
 
 ### Legacy backends: triton / helion (optional)
@@ -151,8 +178,14 @@ detected).
 -m, --mem-fraction      Fraction of free GPU memory to allocate (default: 0.8)
     --compute-backend   Compute kernel backend: auto, torch, fp8, triton, helion (default: auto = fp8 when _scaled_mm works, else torch)
     --burn-streams      Parallel CUDA streams per GPU for the torch/fp8 backends (default: 4)
-    --burn-dim          Matrix dim for the torch backend, auto-shrunk to fit VRAM (default: 8192). fp8 backend autotunes the dim
     --burn-replays      GEMM+ALU+copy replays per CUDA graph (default: 20)
+    --gemm-mix          fp8:bf16 GEMM ratio for the fp8 backend (default: 5:1; 6:0 = pure fp8,
+                        ~16 % more TFLOP/s at the same power)
+    --json PATH         write the run summary as JSON (per-GPU power, throughput, bandwidth,
+                        errors) — report.py --stress embeds it in the PDF as a proof page
+    --burn-dim          force the GEMM dim instead of autotuning it (0 = autotune). A large dim
+                        (e.g. 16384) draws more power; a small one can win the autotune at boost
+                        clocks and then leave 2-3 % of the power budget unused
     --compute-iters     Inner FMA-loop iterations per launch, higher = more compute bound. Triton backend only (default: 2048)
     --block-size        Triton block size in elements. Triton backend only (default: 1024)
     --devices           Comma separated GPU indices, or 'all' (default: all)
@@ -160,7 +193,37 @@ detected).
     --monitor-interval  Seconds between full-system nvidia-smi/rocm-smi snapshots (default: 30)
     --log-dir           Directory for the run log file (default: stress-logs)
     --no-error-check    Disable the compute self-check
+    --min-power-fraction  Fail the run when a GPU's sustained compute-phase power stays below
+                        this fraction of its power limit, e.g. 0.95 (default: 0 = off)
+    --single-process    Stress all GPUs from threads of one process (debug only; multi-GPU
+                        runs use one process per GPU because CUDA graph capture is not
+                        thread-safe)
+    --no-monitor        Disable the periodic full-system SMI snapshot
 ```
+
+## All 8 GPUs of a DGX / HGX node
+
+Multi-GPU runs start **one worker process per GPU** automatically — CUDA graph
+capture is not safe across threads, and a single-process 8-GPU run dies with
+`CUDA_ERROR_ILLEGAL_STATE` on seven of the eight cards.
+
+On an NVSwitch baseboard the GPUs must first register with the NVLink fabric,
+otherwise every CUDA call fails with `Error 802: system not yet initialized`
+even though `nvidia-smi` looks fine. That needs the Fabric Manager **and** the
+NVLink Subnet Manager (`nvlsm`) plus `ib_umad`.
+
+Full runbook, expected numbers and troubleshooting:
+[`docs/8-gpu-dgx-hgx-stress.md`](../docs/8-gpu-dgx-hgx-stress.md).
+
+```bash
+# 8-GPU burn-in acceptance run: fails unless every card holds >=95 % of its power limit
+python3 gpu_stress.py --duration 2h --burn-dim 16384 --min-power-fraction 0.95
+```
+
+`--burn-dim 16384` pins the GEMM size instead of autotuning it: the autotune
+maximises TFLOP/s at boost clocks and can pick a small GEMM that then draws
+2-3 % less power. Pinned, all eight cards sit at 99.2 % of the node's 8.8 kW
+budget instead of 98.3 %.
 
 ## Examples
 

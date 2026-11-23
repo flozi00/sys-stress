@@ -87,6 +87,19 @@ except Exception:  # pragma: no cover - environment dependent
     _HELION_AVAILABLE = False
 
 
+# NVML (the `nvidia-ml-py` package) gives cheap, high resolution power, clock
+# and temperature samples.  It is optional: without it the burn still runs, it
+# just cannot report the power point it reached -- and "did every card sit at
+# its power limit?" is the whole point of a burn-in.
+try:  # pragma: no cover - environment dependent
+    import pynvml as _nvml
+
+    _NVML_AVAILABLE = True
+except Exception:  # pragma: no cover - environment dependent
+    _nvml = None
+    _NVML_AVAILABLE = False
+
+
 # --------------------------------------------------------------------------- #
 # Triton kernels (optional - only when triton imports AND compiles)
 # --------------------------------------------------------------------------- #
@@ -256,21 +269,171 @@ def sample_smi() -> str | None:
     return text or None
 
 
+# Published HBM bandwidth per part, in GB/s.  Only used to print the achieved
+# copy bandwidth as a share of the datasheet peak -- a card that copies at
+# 60 % of its HBM peak is either throttled or not being stressed hard enough.
+# Anything not listed is reported as an absolute number without a percentage.
+HBM_PEAK_GBS: dict[str, float] = {
+    "B300": 7700.0,
+    "GB300": 7700.0,
+    "B200": 8000.0,
+    "GB200": 8000.0,
+    "H200": 4800.0,
+    "H100": 3350.0,
+    "A100": 2039.0,
+    "MI325X": 6000.0,
+    "MI300X": 5300.0,
+    "RTX PRO 6000": 1792.0,
+    "RTX 5090": 1792.0,
+    "RTX 4090": 1008.0,
+}
+
+
+def hbm_peak_gbs(name: str) -> float:
+    """Datasheet HBM bandwidth for a device name, or 0.0 when unknown."""
+    for key, value in HBM_PEAK_GBS.items():
+        if key.lower() in name.lower():
+            return value
+    return 0.0
+
+
+class PowerSampler(threading.Thread):
+    """Sample one GPU's power, clock and temperature while the burn runs.
+
+    The burn loop labels each phase ("compute" / "mem"), so the summary can
+    report the power of the *compute* phase -- the phase that has to sit at
+    the card's power limit -- separately from the memory phase and the idle
+    ramp.  Averaging the ramp into the number is what makes a card at its
+    limit look like it only reached 60 %.
+    """
+
+    def __init__(self, device: int, interval: float = 0.25):
+        super().__init__(daemon=True)
+        self.device = device
+        self.interval = interval
+        self.phase = "ramp"
+        self.samples: list[tuple[float, str, float, int, int, int]] = []
+        self.power_limit_w = 0.0
+        self._stop_event = threading.Event()
+        self._t0 = time.time()
+        self._handle = None
+        nvml = _nvml
+        if nvml is not None:
+            try:
+                nvml.nvmlInit()
+                self._handle = nvml.nvmlDeviceGetHandleByIndex(device)
+                self.power_limit_w = (
+                    nvml.nvmlDeviceGetPowerManagementLimit(self._handle) / 1000.0
+                )
+            except Exception:  # pragma: no cover - environment dependent
+                self._handle = None
+
+    @property
+    def available(self) -> bool:
+        return self._handle is not None
+
+    def reset(self) -> None:
+        """Drop the setup/autotune samples and restart the ramp clock."""
+        self.samples.clear()
+        self._t0 = time.time()
+        self.phase = "ramp"
+
+    def run(self) -> None:  # pragma: no cover - timing dependent
+        nvml = _nvml
+        if self._handle is None or nvml is None:
+            return
+        while not self._stop_event.is_set():
+            try:
+                self.samples.append(
+                    (
+                        time.time(),
+                        self.phase,
+                        nvml.nvmlDeviceGetPowerUsage(self._handle) / 1000.0,
+                        nvml.nvmlDeviceGetClockInfo(self._handle, nvml.NVML_CLOCK_SM),
+                        nvml.nvmlDeviceGetTemperature(
+                            self._handle, nvml.NVML_TEMPERATURE_GPU
+                        ),
+                        nvml.nvmlDeviceGetUtilizationRates(self._handle).gpu,
+                    )
+                )
+            except Exception:  # pragma: no cover - environment dependent
+                pass
+            self._stop_event.wait(self.interval)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def summary(self, skip_seconds: float = 5.0) -> dict:
+        """Sustained power/clock/temperature, ramp excluded."""
+        if not self.samples:
+            return {}
+        usable = [s for s in self.samples if s[0] - self._t0 >= skip_seconds]
+        if not usable:
+            usable = list(self.samples)
+        compute = [s for s in usable if s[1] == "compute"] or usable
+
+        def mean(values: list[float]) -> float:
+            return sum(values) / len(values) if values else 0.0
+
+        return {
+            "power_mean_w": round(mean([s[2] for s in usable]), 1),
+            "power_compute_w": round(mean([s[2] for s in compute]), 1),
+            "power_max_w": round(max(s[2] for s in usable), 1),
+            "power_limit_w": round(self.power_limit_w, 1),
+            "clock_sm_mhz": round(mean([float(s[3]) for s in compute]), 0),
+            "temp_max_c": max(s[4] for s in usable),
+            "util_pct": round(mean([float(s[5]) for s in compute]), 1),
+            "samples": len(usable),
+        }
+
+
 # --------------------------------------------------------------------------- #
 # Per-GPU worker
 # --------------------------------------------------------------------------- #
 @dataclass
 class GpuResult:
     device: int
+    name: str = ""
     iterations: int = 0
     errors: int = 0
     best_tflops: float = 0.0
     last_tflops: float = 0.0
     best_bandwidth: float = 0.0
     last_bandwidth: float = 0.0
+    sum_tflops: float = 0.0
+    sum_bandwidth: float = 0.0
     backend: str = "triton"
     failed: bool = False
     message: str = ""
+    # Power point reached during the run (NVML, ramp excluded).
+    power_mean_w: float = 0.0
+    power_compute_w: float = 0.0
+    power_max_w: float = 0.0
+    power_limit_w: float = 0.0
+    clock_sm_mhz: float = 0.0
+    temp_max_c: float = 0.0
+    util_pct: float = 0.0
+    hbm_peak_gbs: float = 0.0
+
+    def mean_tflops(self) -> float:
+        """Sustained (per-iteration average) compute throughput."""
+        return self.sum_tflops / self.iterations if self.iterations else 0.0
+
+    def mean_bandwidth(self) -> float:
+        """Sustained (per-iteration average) memory bandwidth."""
+        return self.sum_bandwidth / self.iterations if self.iterations else 0.0
+
+    def power_fraction(self) -> float:
+        """Sustained compute-phase power as a share of the card's limit."""
+        if self.power_limit_w <= 0:
+            return 0.0
+        return self.power_compute_w / self.power_limit_w
+
+    def bandwidth_fraction(self) -> float:
+        """Sustained copy bandwidth as a share of the datasheet HBM peak."""
+        if self.hbm_peak_gbs <= 0:
+            return 0.0
+        return self.mean_bandwidth() / self.hbm_peak_gbs
 
 
 @dataclass
@@ -284,8 +447,29 @@ class StressConfig:
     compute_backend: str = "auto"
     devices: list[int] = field(default_factory=list)
     burn_streams: int = 4
-    burn_dim: int = 8192
+    burn_dim: int = 0  # 0 = autotune (fp8) / 8192 (torch)
     burn_replays: int = 20
+    gemm_mix: str = "5:1"
+
+
+def parse_gemm_mix(value: str) -> str:
+    """Validate an ``fp8:bf16`` GEMM ratio such as ``5:1`` or ``6:0``."""
+    parts = value.replace(" ", "").split(":")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(f"invalid gemm mix: {value!r} (expected fp8:bf16)")
+    try:
+        fp8, bf16 = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid gemm mix: {value!r} (expected fp8:bf16)")
+    if fp8 < 0 or bf16 < 0 or fp8 + bf16 < 1:
+        raise argparse.ArgumentTypeError(f"invalid gemm mix: {value!r} (need at least one GEMM)")
+    return f"{fp8}:{bf16}"
+
+
+def gemm_mix_counts(value: str) -> tuple[int, int]:
+    """Return ``(fp8_gemms, bf16_gemms)`` for a validated mix string."""
+    fp8, bf16 = value.split(":")
+    return int(fp8), int(bf16)
 
 
 def resolve_backend(requested: str) -> str:
@@ -343,6 +527,33 @@ def _has_fp8_scaled_mm(device) -> bool:
         return False
 
 
+def _make_fp8_buffers(dev, n: int) -> tuple:
+    """One stream's worth of fp8-burn buffers (18*n^2 bytes)."""
+    fa = torch.randn(n, n, device=dev).to(torch.float8_e4m3fn)
+    fb = torch.randn(n, n, device=dev).to(torch.float8_e4m3fn).t().contiguous().t()
+    # zeros, not empty: with a pure-fp8 or pure-bf16 mix one of the two
+    # outputs is never written, and the self-check must not compare
+    # uninitialised memory (NaN != NaN would fake a compute error).
+    fc = torch.zeros(n, n, device=dev, dtype=torch.bfloat16)
+    fa_f32 = torch.randn(n, n, device=dev, dtype=torch.float32)
+    fb_f32 = torch.randn(n, n, device=dev, dtype=torch.float32)
+    sa = torch.randn(n, n, device=dev, dtype=torch.bfloat16)
+    sb = torch.randn(n, n, device=dev, dtype=torch.bfloat16)
+    sc = torch.zeros(n, n, device=dev, dtype=torch.bfloat16)
+    return fa, fb, fc, fa_f32, fb_f32, sa, sb, sc
+
+
+def _prepare_fp8_buffers(dev, n: int, n_streams: int) -> list:
+    """Allocate ``n_streams`` buffer sets, shrinking ``n`` until they fit."""
+    for _ in range(6):
+        try:
+            return [_make_fp8_buffers(dev, n) for _ in range(n_streams)]
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            n = max(1024, (n * 3 // 4 // 256) * 256)
+    raise torch.OutOfMemoryError("could not fit fp8 burn buffers in VRAM")
+
+
 def _autotune_fp8_dim(
     device: int,
     dev,
@@ -374,23 +585,14 @@ def _autotune_fp8_dim(
     torch.cuda.manual_seed_all(1234)
     s = torch.tensor(1.0, device=dev)
     one = torch.ones((), device=dev)
+    n_fp8, n_bf16 = gemm_mix_counts(cfg.gemm_mix)
 
-    def make_buffers(n):
-        fa = torch.randn(n, n, device=dev).to(torch.float8_e4m3fn)
-        fb = torch.randn(n, n, device=dev).to(torch.float8_e4m3fn).t().contiguous().t()
-        fc = torch.empty(n, n, device=dev, dtype=torch.bfloat16)
-        fa_f32 = torch.randn(n, n, device=dev, dtype=torch.float32)
-        fb_f32 = torch.randn(n, n, device=dev, dtype=torch.float32)
-        sa = torch.randn(n, n, device=dev, dtype=torch.bfloat16)
-        sb = torch.randn(n, n, device=dev, dtype=torch.bfloat16)
-        sc = torch.empty(n, n, device=dev, dtype=torch.bfloat16)
-        return fa, fb, fc, fa_f32, fb_f32, sa, sb, sc
 
     best_n, best_tflops, best_bufs = -1, -1.0, None
     with torch.no_grad():
         for cand in candidates:
             try:
-                bufs = [make_buffers(cand) for _ in range(n_streams)]
+                bufs = [_make_fp8_buffers(dev, cand) for _ in range(n_streams)]
                 torch.cuda.synchronize(device)
                 # Warmup so cuBLAS picks its fastest algorithm before capture.
                 for (fa, fb, fc, fa_f32, fb_f32, sa, sb, sc) in bufs:
@@ -399,8 +601,8 @@ def _autotune_fp8_dim(
                         torch.mm(sa, sb, out=sc)
                     fc.copy_(fa_f32.to(torch.bfloat16))
                 torch.cuda.synchronize(device)
-                # Capture one repeat unit: 5 fp8 GEMMs + 1 bf16 GEMM (drives
-                # both fp8 and bf16 tensor-core paths, filling wave tail).
+                # Capture one repeat unit: n_fp8 fp8 GEMMs + n_bf16 bf16 GEMMs
+                # (drives both tensor-core paths, filling the wave tail).
                 reps = max(2, min(8, cfg.burn_replays))
                 graphs = []
                 for (fa, fb, fc, fa_f32, fb_f32, sa, sb, sc) in bufs:
@@ -408,9 +610,10 @@ def _autotune_fp8_dim(
                     g = torch.cuda.CUDAGraph()
                     with torch.cuda.stream(st), torch.cuda.graph(g):
                         for i in range(reps):
-                            for _ in range(5):
+                            for _ in range(n_fp8):
                                 torch._scaled_mm(fa, fb, scale_a=s, scale_b=s, out_dtype=torch.bfloat16)
-                            torch.mm(sa, sb, out=sc)
+                            for _ in range(n_bf16):
+                                torch.mm(sa, sb, out=sc)
                             if i % 4 == 3:
                                 fa_f32.to(torch.bfloat16)
                                 fb_f32.to(torch.bfloat16)
@@ -424,14 +627,18 @@ def _autotune_fp8_dim(
                             g.replay()
                     torch.cuda.synchronize(device)
                 ms = (time.perf_counter() - t0) / 3 * 1000.0
-                # FLOPs per graph: reps*(5 fp8 + 1 bf16) gemms of 2n^3.
-                flops = reps * 6 * 2.0 * cand**3 * n_streams
+                # FLOPs per graph: reps*(n_fp8 + n_bf16) gemms of 2n^3.
+                flops = reps * (n_fp8 + n_bf16) * 2.0 * cand**3 * n_streams
                 tflops = flops / (ms / 1000.0) / 1e12
                 LOGGER.info(
                     "[GPU %d] autotune fp8 dim=%d: %.0f TFLOP/s (budget max n=%d)",
                     device, cand, tflops, max_n,
                 )
-                if tflops > best_tflops:
+                # Candidates are tried largest-first. A smaller dim must beat
+                # the incumbent by 3 % to win: at boost clocks a small GEMM can
+                # be marginally faster, but at the power limit it draws less
+                # power, which is the opposite of what a burn-in wants.
+                if tflops > best_tflops * 1.03:
                     if best_bufs is not None:
                         del best_bufs
                     best_n, best_tflops, best_bufs = cand, tflops, bufs
@@ -456,6 +663,7 @@ def _run_fp8_burn(
     deadline: float,
     result: GpuResult,
     stop: threading.Event,
+    sampler: PowerSampler,
 ):
     """FP8 tensor-core burn (max TFLOP/s on modern NVIDIA silicon).
 
@@ -476,12 +684,21 @@ def _run_fp8_burn(
                 "falling back to bf16 torch burn",
                 device,
             )
-            _run_torch_burn(device, cfg, deadline, result, stop)
+            _run_torch_burn(device, cfg, deadline, result, stop, sampler)
             return
         n_streams = max(1, cfg.burn_streams)
         reps = max(2, min(8, cfg.burn_replays))
+        n_fp8, n_bf16 = gemm_mix_counts(cfg.gemm_mix)
 
-        n, streams_bufs = _autotune_fp8_dim(device, dev, cfg, n_streams)
+        if cfg.burn_dim > 0:
+            # Explicit dim: skip the autotune (a power-focused burn wants a
+            # large GEMM, not the fastest one at boost clocks).
+            n = max(1024, cfg.burn_dim)
+            streams_bufs = _prepare_fp8_buffers(dev, n, n_streams)
+            LOGGER.info("[GPU %d] fp8 dim forced to %d (autotune skipped)",
+                        device, n)
+        else:
+            n, streams_bufs = _autotune_fp8_dim(device, dev, cfg, n_streams)
         s = torch.tensor(1.0, device=dev)
 
         # Autotuned memory phase: a dedicated alternating-buffers copy sweep
@@ -515,9 +732,10 @@ def _run_fp8_burn(
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.stream(st), torch.cuda.graph(g):
                     for i in range(reps):
-                        for _ in range(5):
+                        for _ in range(n_fp8):
                             torch._scaled_mm(fa, fb, scale_a=s, scale_b=s, out_dtype=torch.bfloat16)
-                        torch.mm(sa, sb, out=sc)
+                        for _ in range(n_bf16):
+                            torch.mm(sa, sb, out=sc)
                         if i % 4 == 3:
                             fa_f32.to(torch.bfloat16)
                             fb_f32.to(torch.bfloat16)
@@ -535,19 +753,22 @@ def _run_fp8_burn(
                 for bufs in streams_bufs
             ]
 
-        flops_per_round = reps * 6 * 2.0 * n * n * n * n_streams
-        # Approx HBM+L2 bytes per round: each 5xfp8+1xbf16 unit reads fa/fb
+        flops_per_round = reps * (n_fp8 + n_bf16) * 2.0 * n * n * n * n_streams
+        # Approx HBM+L2 bytes per round: each fp8/bf16 GEMM unit reads fa/fb
         # (fp8) and sa/sb (bf16) once per gemm while fc/sc/sa/sb rewrite in
-        # place => ~ (5*2 + 6*2/round + conv 12/4th iter) * n^2.
-        bytes_per_round = reps * (10.0 + 12.0 + 3.0) * n * n * n_streams
+        # place => ~ (2*n_fp8 + 2*(n_fp8+n_bf16) + conv 3/4th iter) * n^2.
+        bytes_per_round = (
+            reps * (2.0 * n_fp8 + 2.0 * (n_fp8 + n_bf16) + 3.0) * n * n * n_streams
+        )
         LOGGER.info(
-            "[GPU %d] %s | backend=fp8 | %dx (5xfp8+1xbf16) gemm %dx%d + "
+            "[GPU %d] %s | backend=fp8 | %dx (%dxfp8+%dxbf16) gemm %dx%d + "
             "fp32->bf16 conversions | %d streams",
-            device, torch.cuda.get_device_name(device), reps, n, n, n_streams,
+            device, torch.cuda.get_device_name(device), reps, n_fp8, n_bf16, n, n, n_streams,
         )
 
         last_log = time.time()
         local_iters = 0
+        sampler.reset()
         with torch.no_grad():
             while time.time() < deadline and not stop.is_set():
                 # Device-wide sync timing (CUDA events don't track the
@@ -555,6 +776,7 @@ def _run_fp8_burn(
                 # separately so each metric reflects its own subsystem,
                 # not an amortized blend.
                 torch.cuda.synchronize(device)
+                sampler.phase = "compute"
                 t_start = time.perf_counter()
                 for st, g in graphs:
                     with torch.cuda.stream(st):
@@ -563,6 +785,7 @@ def _run_fp8_burn(
                 t_gemm = time.perf_counter()
                 # Memory phase: alternating copies saturate read+write HBM.
                 if ms_src is not None:
+                    sampler.phase = "mem"
                     ms_dst.copy_(ms_src)
                     ms_src.copy_(ms_alt)
                     torch.cuda.synchronize(device)
@@ -579,8 +802,10 @@ def _run_fp8_burn(
                 tflops = flops_per_round / (gemm_ms / 1000.0) / 1e12
                 result.last_tflops = tflops
                 result.best_tflops = max(result.best_tflops, tflops)
+                result.sum_tflops += tflops
                 result.last_bandwidth = bw
                 result.best_bandwidth = max(result.best_bandwidth, bw)
+                result.sum_bandwidth += bw
                 local_iters += 1
                 result.iterations = local_iters
 
@@ -617,6 +842,7 @@ def _run_torch_burn(
     deadline: float,
     result: GpuResult,
     stop: threading.Event,
+    sampler: PowerSampler,
 ):
     """Pure-torch max-power burn (no Triton/gcc needed).
 
@@ -631,7 +857,7 @@ def _run_torch_burn(
         torch.cuda.set_device(device)
         dev = torch.device(f"cuda:{device}")
         n_streams = max(1, cfg.burn_streams)
-        n = max(1024, cfg.burn_dim)
+        n = max(1024, cfg.burn_dim or 8192)
         replays = max(1, cfg.burn_replays)
 
         # Size the matrices to the free-VRAM budget. Per stream we hold
@@ -721,7 +947,7 @@ def _run_torch_burn(
                 n = max(1024, (n * 3 // 4 // 256) * 256)
                 if n <= 1024 and attempt >= 2 and n_streams > 1:
                     n_streams -= 1
-                    n = max(1024, cfg.burn_dim)
+                    n = max(1024, cfg.burn_dim or 8192)
                 LOGGER.warning(
                     "[GPU %d] OOM during setup, retrying smaller (n=%d, streams=%d)",
                     device,
@@ -751,6 +977,8 @@ def _run_torch_burn(
         end_event = torch.cuda.Event(enable_timing=True)
         last_log = time.time()
         local_iters = 0
+        sampler.reset()
+        sampler.phase = "compute"
         while time.time() < deadline and not stop.is_set():
             # Wall-clock timing around a device-wide sync: CUDA events
             # recorded on the default stream do NOT track work enqueued on
@@ -768,8 +996,10 @@ def _run_torch_burn(
             bw = (copy_bytes_per_graph * n_streams) / (ms / 1000.0) / 1e9
             result.last_tflops = tflops
             result.best_tflops = max(result.best_tflops, tflops)
+            result.sum_tflops += tflops
             result.last_bandwidth = bw
             result.best_bandwidth = max(result.best_bandwidth, bw)
+            result.sum_bandwidth += bw
             local_iters += 1
             result.iterations = local_iters
 
@@ -807,6 +1037,24 @@ def _run_torch_burn(
         LOGGER.exception("[GPU %d] worker crashed: %s", device, exc)
 
 
+def _apply_power_summary(result: GpuResult, sampler: PowerSampler) -> None:
+    """Copy the sampler's sustained numbers into the result record."""
+    summary = sampler.summary()
+    if not summary:
+        return
+    result.power_mean_w = summary["power_mean_w"]
+    result.power_compute_w = summary["power_compute_w"]
+    result.power_max_w = summary["power_max_w"]
+    result.power_limit_w = summary["power_limit_w"]
+    result.clock_sm_mhz = summary["clock_sm_mhz"]
+    result.temp_max_c = summary["temp_max_c"]
+    result.util_pct = summary["util_pct"]
+    try:
+        result.hbm_peak_gbs = hbm_peak_gbs(torch.cuda.get_device_name(result.device))
+    except Exception:  # pragma: no cover - context may be broken after a crash
+        result.hbm_peak_gbs = 0.0
+
+
 def _run_on_device(
     device: int,
     cfg: StressConfig,
@@ -815,12 +1063,34 @@ def _run_on_device(
     stop: threading.Event,
 ):
     """Continuously stress a single GPU until ``deadline`` or ``stop``."""
+    sampler = PowerSampler(device)
+    sampler.start()
+    try:
+        _stress_device(device, cfg, deadline, result, stop, sampler)
+    finally:
+        sampler.stop()
+        sampler.join(timeout=2)
+        _apply_power_summary(result, sampler)
+
+
+def _stress_device(
+    device: int,
+    cfg: StressConfig,
+    deadline: float,
+    result: GpuResult,
+    stop: threading.Event,
+    sampler: PowerSampler,
+):
+    try:
+        result.name = torch.cuda.get_device_name(device)
+    except Exception:  # noqa: BLE001 - cosmetic only
+        result.name = ""
     backend = resolve_backend(cfg.compute_backend)
     if backend == "torch":
-        _run_torch_burn(device, cfg, deadline, result, stop)
+        _run_torch_burn(device, cfg, deadline, result, stop, sampler)
         return
     if backend == "fp8":
-        _run_fp8_burn(device, cfg, deadline, result, stop)
+        _run_fp8_burn(device, cfg, deadline, result, stop, sampler)
         return
     if not _TRITON_AVAILABLE:
         result.failed = True
@@ -887,9 +1157,11 @@ def _run_on_device(
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         last_log = time.time()
+        sampler.reset()
 
         while time.time() < deadline and not stop.is_set():
             # --- compute phase -------------------------------------------- #
+            sampler.phase = "compute"
             start_event.record()
             if backend == "helion":
                 out = _helion_matmul(mat_a, mat_b, mat_c)
@@ -905,6 +1177,7 @@ def _run_on_device(
             tflops = flops / (compute_ms / 1000.0) / 1e12
             result.last_tflops = tflops
             result.best_tflops = max(result.best_tflops, tflops)
+            result.sum_tflops += tflops
 
             # --- self check ----------------------------------------------- #
             # Compare against the reference using a checksum to avoid allocating
@@ -933,6 +1206,7 @@ def _run_on_device(
                         )
 
             # --- memory phase --------------------------------------------- #
+            sampler.phase = "mem"
             start_event.record()
             _copy_kernel[mem_grid](src, dst, mem_n, BLOCK_SIZE=cfg.block_size)
             end_event.record()
@@ -942,6 +1216,7 @@ def _run_on_device(
             bandwidth = (2 * buffer_bytes) / (copy_ms / 1000.0) / 1e9
             result.last_bandwidth = bandwidth
             result.best_bandwidth = max(result.best_bandwidth, bandwidth)
+            result.sum_bandwidth += bandwidth
 
             result.iterations += 1
 
@@ -1028,14 +1303,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--burn-dim",
         type=int,
-        default=8192,
-        help="Matrix dim for the torch burn backend (auto-shrunk to fit VRAM).",
+        default=0,
+        help="Force the GEMM matrix dim instead of autotuning it (0 = autotune "
+             "for the fp8 backend, 8192 for the torch backend). A large dim "
+             "draws more power; a small one can be marginally faster at boost "
+             "clocks but leaves 2-3%% of the power budget unused.",
     )
     parser.add_argument(
         "--burn-replays",
         type=int,
         default=20,
         help="GEMM+ALU+copy replays captured per CUDA graph (torch backend).",
+    )
+    parser.add_argument(
+        "--gemm-mix",
+        type=parse_gemm_mix,
+        default="5:1",
+        help="fp8:bf16 GEMM ratio per replay unit for the fp8 backend. '5:1' "
+        "drives both tensor-core paths; '6:0' is pure fp8 and reaches ~15%% "
+        "more TFLOP/s at the same power.",
     )
     parser.add_argument(
         "--devices",
@@ -1066,31 +1352,382 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable the compute self-check (slightly faster, no fault detection).",
     )
+    parser.add_argument(
+        "--single-process",
+        action="store_true",
+        help="Stress every GPU from threads of one process instead of one "
+        "process per GPU. Only useful for debugging: CUDA graph capture is "
+        "not safe across threads, so multi-GPU runs must use one process "
+        "per GPU (the default).",
+    )
+    parser.add_argument(
+        "--min-power-fraction",
+        type=float,
+        default=0.0,
+        help="Fail the run when a GPU's sustained compute-phase power stays "
+        "below this fraction of its power limit (e.g. 0.95 for a burn-in "
+        "acceptance run). 0 disables the check.",
+    )
+    parser.add_argument(
+        "--json",
+        metavar="PATH",
+        help="Write the run summary as JSON (per-GPU power, throughput, "
+             "bandwidth, errors). report.py --stress embeds it in the PDF.",
+    )
+    parser.add_argument(
+        "--worker-json",
+        type=str,
+        default="",
+        help="Internal: write this worker's result as JSON to the given path.",
+    )
+    parser.add_argument(
+        "--no-log-file",
+        action="store_true",
+        help="Log to stdout only (used by the per-GPU worker processes).",
+    )
+    parser.add_argument(
+        "--no-monitor",
+        action="store_true",
+        help="Disable the periodic full-system SMI snapshot.",
+    )
     return parser
 
 
-def _configure_logging(log_dir: str) -> str:
-    os.makedirs(log_dir, exist_ok=True)
-    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    log_path = os.path.join(log_dir, f"gpu-stress-{ts}.log")
-
+def _configure_logging(log_dir: str, no_log_file: bool = False) -> str:
     LOGGER.setLevel(logging.INFO)
     LOGGER.handlers.clear()
-    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s")
+    # Worker processes are piped through the parent, which adds the timestamp:
+    # they emit "LEVEL message" only, so the parent can re-emit at that level.
+    fmt = logging.Formatter(
+        "%(levelname)-7s %(message)s" if no_log_file else "%(asctime)s %(levelname)-7s %(message)s"
+    )
 
     stream = logging.StreamHandler(sys.stdout)
     stream.setFormatter(fmt)
     LOGGER.addHandler(stream)
 
+    if no_log_file:
+        return ""
+    os.makedirs(log_dir, exist_ok=True)
+    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    log_path = os.path.join(log_dir, f"gpu-stress-{ts}.log")
     file_handler = logging.FileHandler(log_path)
     file_handler.setFormatter(fmt)
     LOGGER.addHandler(file_handler)
     return log_path
 
 
+def _pump_worker_output(proc: subprocess.Popen, device: int) -> None:
+    """Re-emit a worker's stdout through the parent logger.
+
+    The worker processes log to stdout only; piping them through the parent
+    keeps a single, complete run log instead of one file per GPU.
+    """
+    if proc.stdout is None:  # pragma: no cover - defensive
+        return
+    levels = {"INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR}
+    for raw in proc.stdout:
+        line = raw.rstrip()
+        if not line:
+            continue
+        level_name, _, message = line.partition(" ")
+        LOGGER.log(levels.get(level_name, logging.INFO), "%s", message.strip() or line)
+
+
+def _format_gpu_summary(r: GpuResult) -> str:
+    """One result block per GPU: throughput, then the power point it ran at."""
+    lines = [
+        f"[GPU {r.device}] backend={r.backend} | iterations={r.iterations} | "
+        f"compute={r.mean_tflops():.0f} TFLOP/s sustained "
+        f"(best {r.best_tflops:.0f}) | "
+        f"mem={r.mean_bandwidth():.0f} GB/s sustained "
+        f"(best {r.best_bandwidth:.0f}) | errors={r.errors}"
+    ]
+    if r.power_limit_w > 0:
+        lines.append(
+            f"    power: sustained {r.power_compute_w:.0f} W of "
+            f"{r.power_limit_w:.0f} W ({100.0 * r.power_fraction():.1f}%) | "
+            f"peak {r.power_max_w:.0f} W | {r.temp_max_c:.0f} C | "
+            f"SM {r.clock_sm_mhz:.0f} MHz | util {r.util_pct:.0f}%"
+        )
+    if r.hbm_peak_gbs > 0:
+        lines.append(
+            f"    bandwidth: {100.0 * r.bandwidth_fraction():.1f}% of the "
+            f"{r.hbm_peak_gbs:.0f} GB/s datasheet HBM peak"
+        )
+    if r.failed:
+        lines.append(f"    FAILED: {r.message}")
+    return "\n".join(lines)
+
+
+def _write_json(
+    path: str,
+    results: dict[int, GpuResult],
+    devices: list[int],
+    elapsed: float,
+    cfg: "StressConfig",
+    args,
+) -> None:
+    """Write the run summary as JSON — the machine-readable evidence that the
+    PDF report embeds (``report.py --stress``)."""
+    import json
+    import socket
+
+    gpus = []
+    for d in devices:
+        r = results[d]
+        gpus.append({
+            "device": d,
+            "name": r.name,
+            "backend": r.backend,
+            "iterations": r.iterations,
+            "tflops_sustained": round(r.mean_tflops(), 1),
+            "tflops_best": round(r.best_tflops, 1),
+            "bandwidth_sustained_gbs": round(r.mean_bandwidth(), 1),
+            "bandwidth_best_gbs": round(r.best_bandwidth, 1),
+            "hbm_peak_gbs": round(r.hbm_peak_gbs, 1),
+            "bandwidth_fraction": round(r.bandwidth_fraction(), 4),
+            "power_mean_w": round(r.power_compute_w, 1),
+            "power_max_w": round(r.power_max_w, 1),
+            "power_limit_w": round(r.power_limit_w, 1),
+            "power_fraction": round(r.power_fraction(), 4),
+            "clock_sm_mhz": round(r.clock_sm_mhz, 1),
+            "temp_max_c": round(r.temp_max_c, 1),
+            "util_pct": round(r.util_pct, 1),
+            "errors": r.errors,
+            "failed": r.failed,
+            "message": r.message,
+        })
+
+    powered = [r for r in results.values() if r.power_limit_w > 0]
+    total_w = sum(r.power_compute_w for r in powered)
+    total_limit = sum(r.power_limit_w for r in powered)
+    payload = {
+        "timestamp": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "hostname": socket.gethostname(),
+        "duration_s": round(elapsed, 1),
+        "config": {
+            "backend": cfg.compute_backend,
+            "gemm_mix": cfg.gemm_mix,
+            "burn_dim": cfg.burn_dim,
+            "burn_streams": cfg.burn_streams,
+            "burn_replays": cfg.burn_replays,
+            "mem_fraction": cfg.mem_fraction,
+            "min_power_fraction": args.min_power_fraction,
+        },
+        "gpus": gpus,
+        "system": {
+            "gpu_count": len(powered),
+            "power_mean_w": round(total_w, 1),
+            "power_limit_w": round(total_limit, 1),
+            "power_fraction": round(total_w / total_limit, 4) if total_limit else 0.0,
+            "errors": sum(r.errors for r in results.values()),
+            "passed": not any(r.failed or r.errors for r in results.values()),
+        },
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    LOGGER.info("json summary        : %s", path)
+
+
+def _report(
+    results: dict[int, GpuResult],
+    devices: list[int],
+    elapsed: float,
+    log_path: str,
+    min_power_fraction: float,
+) -> int:
+    """Print the final summary, apply the power gate and return the exit code."""
+    if min_power_fraction > 0:
+        for d in devices:
+            r = results[d]
+            if r.power_limit_w <= 0:
+                LOGGER.warning(
+                    "[GPU %d] power gate requested but NVML reported no power "
+                    "limit; cannot verify the power point",
+                    d,
+                )
+                continue
+            if r.power_fraction() < min_power_fraction:
+                r.failed = True
+                r.message = (
+                    f"sustained power {r.power_compute_w:.0f} W is "
+                    f"{100.0 * r.power_fraction():.1f}% of the "
+                    f"{r.power_limit_w:.0f} W limit, below the required "
+                    f"{100.0 * min_power_fraction:.0f}%"
+                )
+
+    total_errors = sum(r.errors for r in results.values())
+    any_failed = any(r.failed for r in results.values())
+
+    LOGGER.info("=" * 72)
+    LOGGER.info("Stress test finished after %s", format_duration(elapsed))
+    for d in devices:
+        LOGGER.info("%s", _format_gpu_summary(results[d]))
+
+    powered = [r for r in results.values() if r.power_limit_w > 0]
+    if powered:
+        total_w = sum(r.power_compute_w for r in powered)
+        total_limit = sum(r.power_limit_w for r in powered)
+        LOGGER.info(
+            "system: sustained GPU power %.0f W of %.0f W (%.1f%%) across %d GPUs",
+            total_w,
+            total_limit,
+            100.0 * total_w / total_limit if total_limit else 0.0,
+            len(powered),
+        )
+    LOGGER.info("total compute errors: %d", total_errors)
+    if log_path:
+        LOGGER.info("log file            : %s", log_path)
+    LOGGER.info("=" * 72)
+
+    if any_failed or total_errors > 0:
+        LOGGER.error("GPU stress test detected problems.")
+        return 1
+    LOGGER.info("All GPUs passed the stress test.")
+    return 0
+
+
+def _run_workers(args, devices: list[int], log_path: str) -> int:
+    """Run one child process per GPU and aggregate their results.
+
+    CUDA graph capture is not safe across threads of one process: with eight
+    GPUs in one process, seven of eight workers died in
+    ``cuStreamBeginCapture`` with ``CUDA_ERROR_ILLEGAL_STATE``.  One process
+    per GPU gives every card its own CUDA context, isolates a crashed worker
+    from the rest and is what a multi-GPU burn-in needs anyway.
+    """
+    import json
+    import tempfile
+
+    tmpdir = tempfile.mkdtemp(prefix="gpu-stress-")
+    script = os.path.abspath(__file__)
+    procs: list[tuple[int, str, subprocess.Popen]] = []
+    for d in devices:
+        out = os.path.join(tmpdir, f"gpu{d}.json")
+        cmd = [
+            sys.executable,
+            script,
+            "--duration",
+            f"{args.duration:.0f}",
+            "--devices",
+            str(d),
+            "--worker-json",
+            out,
+            "--no-log-file",
+            "--no-monitor",
+            "--mem-fraction",
+            str(args.mem_fraction),
+            "--compute-backend",
+            args.compute_backend,
+            "--compute-iters",
+            str(args.compute_iters),
+            "--block-size",
+            str(args.block_size),
+            "--burn-streams",
+            str(args.burn_streams),
+            "--burn-dim",
+            str(args.burn_dim),
+            "--burn-replays",
+            str(args.burn_replays),
+            "--gemm-mix",
+            args.gemm_mix,
+            "--log-interval",
+            str(args.log_interval),
+        ]
+        if args.no_error_check:
+            cmd.append("--no-error-check")
+        procs.append(
+            (
+                d,
+                out,
+                subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                ),
+            )
+        )
+
+    LOGGER.info(
+        "started %d worker processes (one per GPU): %s",
+        len(procs),
+        ", ".join(f"GPU {d} pid {p.pid}" for d, _, p in procs),
+    )
+
+    pumps = [
+        threading.Thread(target=_pump_worker_output, args=(proc, d), daemon=True)
+        for d, _, proc in procs
+    ]
+    for pump in pumps:
+        pump.start()
+
+    start = time.time()
+    stop = threading.Event()
+    monitor = None
+    if not args.no_monitor:
+        monitor = threading.Thread(
+            target=_monitor,
+            args=(start + args.duration, args.monitor_interval, stop),
+            daemon=True,
+        )
+        monitor.start()
+
+    try:
+        for d, _, proc in procs:
+            rc = proc.wait()
+            if rc != 0:
+                LOGGER.error("worker for GPU %d exited with status %d", d, rc)
+    except KeyboardInterrupt:  # pragma: no cover - interactive
+        LOGGER.warning("Interrupted by user, stopping workers ...")
+        for _, _, proc in procs:
+            proc.terminate()
+        for _, _, proc in procs:
+            proc.wait()
+    finally:
+        stop.set()
+        if monitor is not None:
+            monitor.join(timeout=2)
+        for pump in pumps:
+            pump.join(timeout=5)
+
+    results: dict[int, GpuResult] = {}
+    for d, out, _ in procs:
+        try:
+            with open(out, encoding="utf-8") as fh:
+                results[d] = GpuResult(**json.load(fh))
+        except Exception as exc:  # pragma: no cover - worker crash
+            results[d] = GpuResult(
+                device=d, failed=True, message=f"no result from worker: {exc}"
+            )
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+    elapsed = time.time() - start
+    code = _report(results, devices, elapsed, log_path, args.min_power_fraction)
+    if args.json:
+        cfg = StressConfig(
+            duration=args.duration,
+            mem_fraction=args.mem_fraction,
+            compute_iters=args.compute_iters,
+            block_size=args.block_size,
+            error_check=not args.no_error_check,
+            log_interval=args.log_interval,
+            compute_backend=args.compute_backend,
+            devices=devices,
+            burn_streams=args.burn_streams,
+            burn_dim=args.burn_dim,
+            burn_replays=args.burn_replays,
+            gemm_mix=args.gemm_mix,
+        )
+        _write_json(args.json, results, devices, elapsed, cfg, args)
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    log_path = _configure_logging(args.log_dir)
+    log_path = _configure_logging(args.log_dir, args.no_log_file)
 
     if not torch.cuda.is_available():
         LOGGER.error(
@@ -1106,6 +1743,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         devices = [int(d) for d in args.devices.split(",") if d.strip() != ""]
 
+    # Multi-GPU: one process per GPU (see _run_workers for why).
+    if len(devices) > 1 and not args.single_process:
+        return _run_workers(args, devices, log_path)
+
     cfg = StressConfig(
         duration=args.duration,
         mem_fraction=mem_fraction,
@@ -1118,6 +1759,7 @@ def main(argv: list[str] | None = None) -> int:
         burn_streams=args.burn_streams,
         burn_dim=args.burn_dim,
         burn_replays=args.burn_replays,
+        gemm_mix=args.gemm_mix,
     )
 
     effective_backend = resolve_backend(cfg.compute_backend)
@@ -1144,7 +1786,8 @@ def main(argv: list[str] | None = None) -> int:
     LOGGER.info("mem fraction   : %.2f", cfg.mem_fraction)
     LOGGER.info("compute backend: %s (requested: %s)", effective_backend, cfg.compute_backend)
     LOGGER.info("error checking : %s", cfg.error_check)
-    LOGGER.info("log file       : %s", log_path)
+    LOGGER.info("power sampling : %s", "NVML" if _NVML_AVAILABLE else "unavailable")
+    LOGGER.info("log file       : %s", log_path or "(stdout only)")
     LOGGER.info("=" * 72)
 
     start = time.time()
@@ -1152,10 +1795,12 @@ def main(argv: list[str] | None = None) -> int:
 
     results = {d: GpuResult(device=d) for d in devices}
     stop = threading.Event()
-    monitor = threading.Thread(
-        target=_monitor, args=(deadline, args.monitor_interval, stop), daemon=True
-    )
-    monitor.start()
+    monitor = None
+    if not args.no_monitor:
+        monitor = threading.Thread(
+            target=_monitor, args=(deadline, args.monitor_interval, stop), daemon=True
+        )
+        monitor.start()
 
     threads = []
     for d in devices:
@@ -1177,36 +1822,25 @@ def main(argv: list[str] | None = None) -> int:
             th.join()
 
     stop.set()
-    monitor.join(timeout=2)
+    if monitor is not None:
+        monitor.join(timeout=2)
 
     elapsed = time.time() - start
-    total_errors = sum(r.errors for r in results.values())
-    any_failed = any(r.failed for r in results.values())
 
-    LOGGER.info("=" * 72)
-    LOGGER.info("Stress test finished after %s", format_duration(elapsed))
-    for d in devices:
-        r = results[d]
-        LOGGER.info(
-            "[GPU %d] backend=%s | iterations=%d | best compute=%.1f TFLOP/s | "
-            "best mem=%.1f GB/s | errors=%d%s",
-            d,
-            r.backend,
-            r.iterations,
-            r.best_tflops,
-            r.best_bandwidth,
-            r.errors,
-            f" | FAILED: {r.message}" if r.failed else "",
-        )
-    LOGGER.info("total compute errors: %d", total_errors)
-    LOGGER.info("log file            : %s", log_path)
-    LOGGER.info("=" * 72)
+    if args.worker_json:
+        # Worker mode: hand the raw result to the parent, which owns the
+        # summary (and the power gate) for the whole node.
+        import json
 
-    if any_failed or total_errors > 0:
-        LOGGER.error("GPU stress test detected problems.")
-        return 1
-    LOGGER.info("All GPUs passed the stress test.")
-    return 0
+        result = results[devices[0]]
+        with open(args.worker_json, "w", encoding="utf-8") as fh:
+            json.dump(result.__dict__, fh)
+        return 1 if (result.failed or result.errors) else 0
+
+    code = _report(results, devices, elapsed, log_path, args.min_power_fraction)
+    if args.json:
+        _write_json(args.json, results, devices, elapsed, cfg, args)
+    return code
 
 
 if __name__ == "__main__":
