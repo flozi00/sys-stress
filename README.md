@@ -47,6 +47,11 @@ Running **all 8 GPUs of a DGX / HGX node** (NVSwitch fabric, Fabric Manager,
 error 802, power acceptance gate) is documented in
 [`docs/8-gpu-dgx-hgx-stress.md`](docs/8-gpu-dgx-hgx-stress.md).
 
+Serving a frontier MoE model on the same node — DeepSeek-V4.1-Flash-1017,
+476 GiB of weights, TP8 + EP8, DSpark speculative decoding, everything on a
+dedicated NVMe partition — is documented in
+[`docs/deepseek-v4.1-flash-b300.md`](docs/deepseek-v4.1-flash-b300.md).
+
 ### Hardware benchmarks (FLOPS, bandwidth, interconnect)
 
 `gpu-stress` answers "does it stay stable for days?".  [`bench/`](bench/README.md)
