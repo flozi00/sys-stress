@@ -114,6 +114,8 @@ export HF_HUB_OFFLINE=1
 
 exec /models/venv/bin/vllm serve /models/DeepSeek-V4.1-Flash-1017 \
   --served-model-name deepseek-v4.1-flash \
+  --host 0.0.0.0 \
+  --port 8000 \
   --tokenizer-mode deepseek_v41 \
   --enable-expert-parallel \
   --tensor-parallel-size 8 \
@@ -138,6 +140,22 @@ cd /models && setsid nohup ./serve-dsv41.sh > /models/serve.log 2>&1 < /dev/null
 `VLLM_ENGINE_READY_TIMEOUT_S=3600` is not optional: the first start spends
 ~33 min in JIT compilation and kernel autotune before the engine reports ready.
 
+The server binds `0.0.0.0:8000`, so it is reachable from any host that can route
+to the node — no proxy needed:
+
+```bash
+curl http://<node>:8000/v1/models
+curl http://<node>:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-v4.1-flash",
+       "messages":[{"role":"user","content":"Hallo"}],
+       "max_tokens":64,
+       "chat_template_kwargs":{"thinking":false}}'
+```
+
+There is no authentication in front of it. Anyone who can reach port 8000 can
+spend the node's GPUs; keep it on a private network or put a proxy in front.
+
 ## 6. What the first start does
 
 Observed on a cold cache, process start to `/health` returning 200: **~40 min**.
@@ -154,7 +172,9 @@ Observed on a cold cache, process start to `/health` returning 200: **~40 min**.
 | `init engine ... took 1998.77 s`, Rust frontend listening | 15:32 |
 
 Both caches are persistent, so a restart with the same `VLLM_CACHE_ROOT` and
-`FLASHINFER_WORKSPACE_BASE` skips most of this.
+`FLASHINFER_WORKSPACE_BASE` skips most of this: a warm restart measured
+**729.63 s** (`init engine`) instead of 1998.77 s, with the same 206.67 GiB of
+KV cache. The remaining time is the weight load itself, which no cache avoids.
 
 Harmless noise in the log:
 
@@ -178,8 +198,8 @@ Per GPU: 260 GB of 275 GB resident, 33–36 °C idle, ~240 W idle.
 
 | Test | Result |
 | --- | --- |
-| single stream, 512 out | **242 tok/s** |
-| 32 concurrent, 256 out each | **2311 tok/s** aggregate |
+| single stream, 512 out | **360 tok/s** (242 on the first, still-warming run) |
+| 32 concurrent, 256 out each | **2455 tok/s** aggregate |
 | `17*19` | `323` in 148 ms |
 | thinking, effort 25 | 41 reasoning tokens, correct answer |
 | tool call | `get_weather({"city":"Berlin"})`, `finish_reason=tool_calls` |
