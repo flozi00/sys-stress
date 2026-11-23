@@ -773,10 +773,18 @@ def print_report(report: dict[str, Any]) -> None:
 
     for link in report.get("p2p", []):
         if "skipped" in link:
-            print(f"\n== P2P ==\n  skipped: {link['skipped']}")
+            print(f"\n== P2P GPU{link.get('src', '?')} -> GPU{link.get('dst', '?')} =="
+                  f"\n  skipped: {link['skipped']}")
             continue
         print(f"\n== P2P GPU{link['src']} -> GPU{link['dst']} ==")
         print(f"  {_fmt(link['gbs_best'], ' GB/s', 12)} ({link['buffer_mib']} MiB)")
+
+    measured = [l["gbs_best"] for l in report.get("p2p", []) if "gbs_best" in l]
+    if measured:
+        measured.sort()
+        print(f"\n== P2P summary ==\n  {len(measured)} pairs: "
+              f"min {measured[0]:.1f} / median {measured[len(measured) // 2]:.1f} / "
+              f"max {measured[-1]:.1f} GB/s")
 
 
 # --------------------------------------------------------------------------- #
@@ -925,22 +933,40 @@ def main(argv: list[str] | None = None) -> int:
     if args.dtype:
         extra += ["--dtype", *args.dtype]
 
-    for gpu in selected:
-        print(f">> GPU {gpu['index']}: {gpu['name']}", file=sys.stderr, flush=True)
-        child = _spawn("all" if args.command == "all" else args.command, [gpu], extra)
-        if child and child.get("gpus"):
-            report["gpus"].append(child["gpus"][0])
+    if args.command == "p2p":
+        # One child per GPU *pair*: on this class of system all eight cards
+        # cannot share one CUDA context (mixed HMM/ATS addressing modes), so
+        # the pairs are measured two at a time.
+        pairs = [(a, b) for i, a in enumerate(selected) for b in selected[i + 1:]]
+        print(f">> P2P between {len(pairs)} GPU pairs", file=sys.stderr, flush=True)
+        for src, dst in pairs:
+            child = _spawn("p2p", [src, dst], extra)
+            if child and child.get("p2p"):
+                mapping = {0: src["index"], 1: dst["index"]}
+                for link in child["p2p"]:
+                    link["src"] = mapping[link["src"]]
+                    link["dst"] = mapping[link["dst"]]
+                    report["p2p"].append(link)
+            else:
+                report["p2p"].append({"src": src["index"], "dst": dst["index"],
+                                      "skipped": "pair could not be measured"})
+    else:
+        for gpu in selected:
+            print(f">> GPU {gpu['index']}: {gpu['name']}", file=sys.stderr, flush=True)
+            child = _spawn("all" if args.command == "all" else args.command, [gpu], extra)
+            if child and child.get("gpus"):
+                report["gpus"].append(child["gpus"][0])
 
-    if args.command == "all" and len(selected) > 1:
-        print(">> P2P between all GPU pairs", file=sys.stderr, flush=True)
-        child = _spawn("p2p", selected, extra)
-        if child:
-            report["p2p"] = child.get("p2p", [])
-        else:
-            report["p2p"] = [{
-                "skipped": "GPUs cannot share one CUDA context on this host "
-                           "(mixed HMM/ATS addressing modes)",
-            }]
+        if args.command == "all" and len(selected) > 1:
+            print(">> P2P between all GPU pairs", file=sys.stderr, flush=True)
+            child = _spawn("p2p", selected, extra)
+            if child:
+                report["p2p"] = child.get("p2p", [])
+            else:
+                report["p2p"] = [{
+                    "skipped": "GPUs cannot share one CUDA context on this host "
+                               "(mixed HMM/ATS addressing modes)",
+                }]
 
     if not args.quiet:
         print_report(report)

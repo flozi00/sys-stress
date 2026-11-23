@@ -72,6 +72,26 @@ Options: `--lang de|en` (default `de`), `--notes "…"` for a free-text
 paragraph, `--html-only` to skip PDF conversion.  The HTML is always written
 next to the PDF.
 
+### Full-load proof page
+
+`--stress <json>` adds a **Volllast-Nachweis** page: the burn-in numbers as
+evidence, read straight from the JSON that `gpu_stress.py --json` writes.
+
+```bash
+python3 report.py results/bench-*.json -o report.pdf --stress stress.json
+```
+
+The page shows a PASSED/FAILED verdict, the configuration (backend, GEMM mix,
+GEMM size, streams, power gate), sustained power per GPU with its share of the
+limit, sustained TFLOP/s and HBM bandwidth with its share of the datasheet
+peak, the node total and the acceptance criteria.  Repeatable — one page per
+run, so a multi-node delivery gets one proof page per node.
+
+```bash
+export SYS_STRESS_STRESS_JSON=~/stress-hgx-b300.json   # picked up by --pdf
+./run_remote.sh --pdf all
+```
+
 PDF conversion uses **WeasyPrint** (real page numbers via CSS paged media),
 then **headless Chrome**, then **wkhtmltopdf** — whichever is installed.  No
 Python dependencies beyond the standard library.

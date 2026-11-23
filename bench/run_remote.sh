@@ -52,6 +52,7 @@ if [ "${REPORT}" = "1" ]; then
         -o "${OUT_DIR}/bench-${STAMP}.pdf" \
         ${SYS_STRESS_REPORT_TITLE:+--title "${SYS_STRESS_REPORT_TITLE}"} \
         ${SYS_STRESS_REPORT_SUBTITLE:+--subtitle "${SYS_STRESS_REPORT_SUBTITLE}"} \
-        ${SYS_STRESS_REPORT_OPERATOR:+--operator "${SYS_STRESS_REPORT_OPERATOR}"}
+        ${SYS_STRESS_REPORT_OPERATOR:+--operator "${SYS_STRESS_REPORT_OPERATOR}"} \
+        ${SYS_STRESS_STRESS_JSON:+--stress "${SYS_STRESS_STRESS_JSON}"}
     echo ">> done: ${OUT_DIR}/bench-${STAMP}.pdf"
 fi

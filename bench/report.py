@@ -77,6 +77,28 @@ STRINGS: dict[str, dict[str, str]] = {
         "of": "von",
         "no_data": "keine Daten",
         "appendix": "Anhang: Rohdaten",
+        "stress": "Volllast-Nachweis",
+        "stress_note": "Dauerlast-Messung mit dem Stresstest (gpu_stress.py): "
+                       "jede Karte wird über die gesamte Laufzeit mit FP8-/BF16-"
+                       "Tensor-Core-GEMMs, FP32-Konvertierungen und HBM-Kopien "
+                       "ausgelastet. Angegeben ist die dauerhaft gehaltene "
+                       "Leistungsaufnahme (ohne Anlaufphase) und der über alle "
+                       "Iterationen gemittelte Durchsatz.",
+        "stress_passed": "BESTANDEN",
+        "stress_failed": "NICHT BESTANDEN",
+        "stress_duration": "Laufzeit",
+        "stress_config": "Konfiguration",
+        "stress_power": "Leistungsaufnahme",
+        "stress_share_limit": "Anteil Power-Limit",
+        "stress_throughput": "Rechenleistung",
+        "stress_hbm": "HBM-Bandbreite",
+        "stress_temp": "Temp.",
+        "stress_errors": "Fehler",
+        "stress_system": "System gesamt",
+        "stress_criteria": "Abnahmekriterien",
+        "stress_gate": "Power-Gate",
+        "stress_verdict": "Ergebnis",
+        "stress_no_gate": "kein Gate gesetzt",
     },
     "en": {
         "kicker": "Hardware benchmark",
@@ -123,6 +145,28 @@ STRINGS: dict[str, dict[str, str]] = {
         "of": "of",
         "no_data": "no data",
         "appendix": "Appendix: raw data",
+        "stress": "Full-load proof",
+        "stress_note": "Sustained-load measurement from the stress test "
+                       "(gpu_stress.py): every card is driven with FP8/BF16 "
+                       "tensor-core GEMMs, FP32 conversions and HBM copies for "
+                       "the whole run. Figures are the power held continuously "
+                       "(ramp excluded) and the throughput averaged over all "
+                       "iterations.",
+        "stress_passed": "PASSED",
+        "stress_failed": "FAILED",
+        "stress_duration": "Duration",
+        "stress_config": "Configuration",
+        "stress_power": "Power draw",
+        "stress_share_limit": "Share of power limit",
+        "stress_throughput": "Compute throughput",
+        "stress_hbm": "HBM bandwidth",
+        "stress_temp": "Temp.",
+        "stress_errors": "Errors",
+        "stress_system": "System total",
+        "stress_criteria": "Acceptance criteria",
+        "stress_gate": "Power gate",
+        "stress_verdict": "Result",
+        "stress_no_gate": "no gate set",
     },
 }
 
@@ -241,6 +285,9 @@ li { margin-bottom: 1.2mm; }
 .tag { display: inline-block; font-size: 7.4pt; padding: 0.4mm 1.6mm;
        border-radius: 1mm; background: #eaf0fb; color: #2f6feb; font-weight: 700; }
 .tag.warn { background: #fdf1e3; color: #b06a12; }
+.tag.ok   { background: #e6f4ea; color: #1e7a3c; }
+.tag.bad  { background: #fdeaea; color: #b3261e; }
+.verdict { margin: 0 0 3mm 0; font-size: 10pt; }
 .footer-note { margin-top: 6mm; font-size: 7.6pt; color: #8a94a6;
                border-top: 0.4pt solid #e6eaf1; padding-top: 2mm; }
 """
@@ -585,6 +632,109 @@ def p2p_section(report: dict[str, Any], t: dict[str, str]) -> str:
             f'{"".join(rows)}</table>')
 
 
+def stress_section(stress: dict[str, Any], t: dict[str, str]) -> str:
+    """Full-load proof: the burn-in numbers as evidence, one page.
+
+    Rendered from the JSON that ``gpu_stress.py --json`` writes, so every
+    figure in the PDF is the measured value — nothing is retyped.
+    """
+    gpus = stress.get("gpus", [])
+    if not gpus:
+        return ""
+    system = stress.get("system", {})
+    cfg = stress.get("config", {})
+    passed = bool(system.get("passed"))
+
+    badge = (f'<span class="tag ok">{esc(t["stress_passed"])}</span>' if passed
+             else f'<span class="tag bad">{esc(t["stress_failed"])}</span>')
+
+    dim = cfg.get("burn_dim") or 0
+    gate = cfg.get("min_power_fraction") or 0
+    # The effective backend is what the workers actually ran, not what was
+    # requested ("auto" resolves to fp8 on Hopper/Blackwell).
+    backend = next((g.get("backend") for g in gpus if g.get("backend")), None) \
+        or cfg.get("backend", "–")
+    facts = [
+        f'{t["stress_duration"]} {num(stress.get("duration_s"), 0)} s',
+        f'Backend {backend}',
+        f'GEMM-Mix {cfg.get("gemm_mix", "–")}',
+        f'GEMM {f"{dim}²" if dim else "autotune"}',
+        f'{cfg.get("burn_streams", "–")} Streams',
+        (f'{t["stress_gate"]} ≥ {100 * gate:.0f} %' if gate else t["stress_no_gate"]),
+    ]
+
+    power_rows = []
+    for g in gpus:
+        pf = 100.0 * (g.get("power_fraction") or 0.0)
+        power_rows.append(
+            f'<tr><td>GPU {esc(g.get("device"))}</td>'
+            f'<td class="num">{num(g.get("power_mean_w"), 0)} W</td>'
+            f'<td>{bar(pf)}</td>'
+            f'<td class="num">{num(g.get("power_max_w"), 0)} W</td>'
+            f'<td class="num">{num(g.get("clock_sm_mhz"), 0)} MHz</td>'
+            f'<td class="num">{num(g.get("temp_max_c"), 0)} °C</td></tr>'
+        )
+    total_w = system.get("power_mean_w")
+    total_limit = system.get("power_limit_w")
+    total_pct = 100.0 * (system.get("power_fraction") or 0.0)
+    power_rows.append(
+        f'<tr class="total"><td>{esc(t["stress_system"])}</td>'
+        f'<td class="num">{num(total_w, 0)} W</td>'
+        f'<td>{bar(total_pct)}</td>'
+        f'<td class="num">{num(total_limit, 0)} W</td>'
+        f'<td class="num">–</td><td class="num">–</td></tr>'
+    )
+
+    tp_rows = []
+    for g in gpus:
+        bf = 100.0 * (g.get("bandwidth_fraction") or 0.0)
+        tp_rows.append(
+            f'<tr><td>GPU {esc(g.get("device"))}</td>'
+            f'<td class="num">{num(g.get("tflops_sustained"), 0)} TFLOP/s</td>'
+            f'<td class="num">{num(g.get("tflops_best"), 0)} TFLOP/s</td>'
+            f'<td class="num">{num(g.get("bandwidth_sustained_gbs"), 0)} GB/s</td>'
+            f'<td>{bar(bf)}</td>'
+            f'<td class="num">{esc(g.get("errors", 0))}</td></tr>'
+        )
+
+    criteria = [
+        f'{len(gpus)}/{len(gpus)} GPUs haben Iterationen geliefert'
+        if all(g.get("iterations") for g in gpus) else
+        f'nur {sum(1 for g in gpus if g.get("iterations"))}/{len(gpus)} GPUs aktiv',
+        (f'Dauerleistung ≥ {100 * gate:.0f} % des Power-Limits' if gate
+         else 'kein Power-Gate gesetzt'),
+        f'{system.get("errors", 0)} Rechenfehler',
+        'Ergebnis: ' + (t["stress_passed"] if passed else t["stress_failed"]),
+    ]
+    crit_items = "".join(f"<li>{esc(c)}</li>" for c in criteria)
+
+    return f"""
+<div class="pagebreak"></div>
+<h2>{esc(t['stress'])}</h2>
+<div class="verdict">{badge} &nbsp; <span class="note">{esc(' · '.join(facts))}</span></div>
+<p class="note">{esc(t['stress_note'])}</p>
+
+<h3>{esc(t['stress_power'])}</h3>
+<table>
+  <tr><th>{esc(t['device'])}</th><th class="num">{esc(t['stress_power'])}</th>
+      <th>{esc(t['stress_share_limit'])}</th><th class="num">Spitze</th>
+      <th class="num">SM-Takt</th><th class="num">{esc(t['stress_temp'])}</th></tr>
+  {''.join(power_rows)}
+</table>
+
+<h3>{esc(t['stress_throughput'])} &amp; {esc(t['stress_hbm'])}</h3>
+<table>
+  <tr><th>{esc(t['device'])}</th><th class="num">{esc(t['stress_throughput'])}</th>
+      <th class="num">Spitze</th><th class="num">{esc(t['stress_hbm'])}</th>
+      <th>{esc(t['share'])}</th><th class="num">{esc(t['stress_errors'])}</th></tr>
+  {''.join(tp_rows)}
+</table>
+
+<h3>{esc(t['stress_criteria'])}</h3>
+<ul>{crit_items}</ul>
+"""
+
+
 def method_section(t: dict[str, str], lang: str) -> str:
     items = "".join(f"<li>{esc(x)}</li>" for x in METHOD[lang])
     return f'<h2>{esc(t["method"])}</h2><ul>{items}</ul>'
@@ -598,13 +748,16 @@ def sources_section(t: dict[str, str]) -> str:
     return f'<h2>{esc(t["sources"])}</h2><ul>{items}</ul>'
 
 
-def render(report: dict[str, Any], meta: dict[str, str], lang: str) -> str:
+def render(report: dict[str, Any], meta: dict[str, str], lang: str,
+           stress: list[dict[str, Any]] | None = None) -> str:
     t = STRINGS[lang]
     body = [
         cover(report, meta, t),
         host_section(report, t),
         summary_section(report, t),
     ]
+    for run in stress or []:
+        body.append(stress_section(run, t))
     for gpu in report.get("gpus", []):
         body.append(gpu_section(gpu, t))
     body.append('<div class="pagebreak"></div>')
@@ -689,6 +842,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--subtitle", help="subtitle, e.g. customer or project")
     parser.add_argument("--operator", help="who ran the benchmark")
     parser.add_argument("--notes", help="free-text paragraph appended to the report")
+    parser.add_argument("--stress", action="append", metavar="JSON",
+                        help="JSON written by gpu_stress.py --json; embeds the "
+                             "burn-in numbers as a full-load proof page. "
+                             "Repeatable (one page per run).")
     parser.add_argument("--lang", choices=sorted(STRINGS), default="de")
     parser.add_argument("--html-only", action="store_true",
                         help="write the HTML but skip PDF conversion")
@@ -705,7 +862,11 @@ def main(argv: list[str] | None = None) -> int:
         "notes": args.notes or "",
         "source": os.path.basename(args.report),
     }
-    document = render(report, meta, args.lang)
+    stress = []
+    for path in args.stress or []:
+        with open(path, encoding="utf-8") as fh:
+            stress.append(json.load(fh))
+    document = render(report, meta, args.lang, stress)
 
     out_pdf = os.path.abspath(args.out)
     html_path = os.path.splitext(out_pdf)[0] + ".html"
