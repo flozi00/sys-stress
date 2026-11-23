@@ -43,6 +43,10 @@ unstable overclock, faulty hardware) is counted and logged as an error.
 See [`gpu-stress/README.md`](gpu-stress/README.md) for full options, the
 duration / time format (`30m`, `2h`, `3d`, …), and bare-metal instructions.
 
+Running **all 8 GPUs of a DGX / HGX node** (NVSwitch fabric, Fabric Manager,
+error 802, power acceptance gate) is documented in
+[`docs/8-gpu-dgx-hgx-stress.md`](docs/8-gpu-dgx-hgx-stress.md).
+
 ### Hardware benchmarks (FLOPS, bandwidth, interconnect)
 
 `gpu-stress` answers "does it stay stable for days?".  [`bench/`](bench/README.md)
